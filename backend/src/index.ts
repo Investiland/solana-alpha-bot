@@ -2,7 +2,6 @@ import 'dotenv/config';
 import axios from 'axios';
 import TelegramBot from 'node-telegram-bot-api';
 import { createClient } from '@supabase/supabase-js';
-import { Anthropic } from '@anthropic-ai/sdk';
 import cron from 'node-cron';
 
 // Init clients
@@ -12,12 +11,12 @@ const supabase = createClient(
 );
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN!, { polling: false });
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY!;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
 const RPC_ENDPOINT = `https://api.helius.xyz/v0?api-key=${HELIUS_API_KEY}`;
 const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex';
+const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
 
 interface Token {
   address: string;
@@ -52,23 +51,34 @@ const config = {
 
 let processingCount = 0;
 let alertCount = 0;
+let lastProcessedSignature = '';
 
-// Solana service
-async function getSolanaTokens(): Promise<Token[]> {
+// Get recent token transfers
+async function getRecentTokenTransfers(): Promise<string[]> {
   try {
-    console.log('🔍 Fetching recent tokens from Solana...');
-    
-    // Helius searchAssets requires premium tier
-    // For now, return empty array
-    // We'll implement proper token discovery later
-    
-    return [];
+    // Query for recent token program interactions
+    // This scans for new SPL token creations and activity
+    const response = await axios.post(SOLANA_RPC, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getSignaturesForAddress',
+      params: [
+        'TokenkegQfeZyiNwAJsyFbPVwwQQfg5bgUqh7QeRH8H', // SPL Token program
+        { limit: 100 }
+      ],
+    });
+
+    if (response.data.result) {
+      return response.data.result.map((tx: any) => tx.signature);
+    }
   } catch (error) {
-    console.error('Error fetching tokens:', error);
-    return [];
+    console.error('Error getting recent transfers:', error);
   }
+
+  return [];
 }
 
+// Get token info from Dexscreener
 async function getDexData(tokenAddress: string) {
   try {
     const response = await axios.get(`${DEXSCREENER_API}/tokens/solana/${tokenAddress}`);
@@ -78,15 +88,18 @@ async function getDexData(tokenAddress: string) {
         marketCap: parseFloat(pair.marketCap || 0),
         liquidity: parseFloat(pair.liquidity?.usd || 0),
         volume24h: parseFloat(pair.volume?.h24 || 0),
+        name: pair.baseToken?.name || 'Unknown',
+        symbol: pair.baseToken?.symbol || 'Unknown',
       };
     }
   } catch (error) {}
   return null;
 }
 
+// Get holder info from Solana RPC
 async function getHolderInfo(tokenAddress: string) {
   try {
-    const response = await axios.post(RPC_ENDPOINT, {
+    const response = await axios.post(SOLANA_RPC, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getTokenLargestAccounts',
@@ -107,9 +120,10 @@ async function getHolderInfo(tokenAddress: string) {
   return null;
 }
 
+// Get token age
 async function getTokenAge(tokenAddress: string): Promise<number> {
   try {
-    const response = await axios.post(RPC_ENDPOINT, {
+    const response = await axios.post(SOLANA_RPC, {
       jsonrpc: '2.0',
       id: 1,
       method: 'getSignaturesForAddress',
@@ -125,12 +139,32 @@ async function getTokenAge(tokenAddress: string): Promise<number> {
   return 0;
 }
 
-// Scoring
+// Get token metadata
+async function getTokenMetadata(tokenAddress: string) {
+  try {
+    const response = await axios.post(SOLANA_RPC, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getTokenSupply',
+      params: [tokenAddress],
+    });
+
+    if (response.data.result) {
+      return {
+        supply: parseFloat(response.data.result.value.amount),
+        decimals: response.data.result.value.decimals,
+      };
+    }
+  } catch (error) {}
+  return null;
+}
+
+// Scoring engine
 function scoreToken(token: Token): ScoringResult {
-  const velocityScore = token.volume24h / Math.max(token.liquidity, 1) > 5 ? 100 : token.volume24h / Math.max(token.liquidity, 1) > 3 ? 85 : 50;
+  const velocityScore = token.volume24h / Math.max(token.liquidity, 1) > 5 ? 100 : token.volume24h / Math.max(token.liquidity, 1) > 3 ? 85 : token.volume24h / Math.max(token.liquidity, 1) > 1 ? 70 : 50;
   const holderScore = token.holders > 1000 ? 100 : token.holders > 500 ? 90 : token.holders > 300 ? 75 : 50;
   const liquidityScore = token.liquidity > 500000 ? 100 : token.liquidity > 250000 ? 90 : token.liquidity > 100000 ? 70 : 50;
-  const volumeScore = token.volume24h > 1000000 ? 100 : token.volume24h > 500000 ? 90 : token.volume24h > 100000 ? 70 : 50;
+  const volumeScore = token.volume24h > 1000000 ? 100 : token.volume24h > 500000 ? 90 : token.volume24h > 100000 ? 70 : token.volume24h > 50000 ? 50 : 30;
 
   let riskScore = 0;
   if (token.top5HoldersPct > 75) riskScore += 40;
@@ -139,6 +173,7 @@ function scoreToken(token: Token): ScoringResult {
   if (token.isMintable) riskScore += 20;
   if (token.isFreezeEnabled) riskScore += 20;
   if (token.ageHours < 72) riskScore += 10;
+  if (token.ageHours < 48) riskScore += 15; // Very new tokens are risky
 
   const baseScore = Math.round(velocityScore * 0.35 + holderScore * 0.25 + liquidityScore * 0.2 + volumeScore * 0.2 - riskScore * 0.1);
   const totalScore = Math.min(100, Math.max(0, baseScore));
@@ -167,12 +202,13 @@ function scoreToken(token: Token): ScoringResult {
   };
 }
 
-// Telegram alert
+// Send Telegram alert
 async function sendAlert(token: Token, score: ScoringResult) {
   const message = `
 🚀 ALPHA SIGNAL
 
 Token: ${token.name} ($${token.symbol})
+Address: \`${token.address}\`
 Score: ${score.totalScore}/100
 Recommendation: ${score.recommendation}
 
@@ -194,88 +230,163 @@ Recommendation: ${score.recommendation}
 - Mintable: ${score.risks.mintableRisk}
 - Freeze: ${score.risks.freezeRisk}
 
-🔗 [Dexscreener](https://dexscreener.com/solana/${token.address})
+🔗 [Dexscreener](https://dexscreener.com/solana/${token.address}) | [Raydium](https://raydium.io/swap/?inputCurrency=${token.address}) | [Solscan](https://solscan.io/token/${token.address})
 `;
 
   try {
     await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown', disable_web_page_preview: true });
-    console.log(`✅ Alert sent for ${token.symbol}`);
+    console.log(`✅ Alert sent for ${token.symbol} (Score: ${score.totalScore})`);
   } catch (error) {
     console.error('Error sending Telegram alert:', error);
   }
 }
 
-// Main listener
+// Main listener cycle
 async function runListener() {
-  console.log('🔍 Fetching Solana tokens...');
-  const tokens = await getSolanaTokens();
+  try {
+    console.log('🔍 Scanning Solana blockchain for opportunities...');
+    
+    // Get recent token transfers
+    const signatures = await getRecentTokenTransfers();
+    
+    if (signatures.length === 0) {
+      console.log('⏸️ No recent activity detected');
+      return;
+    }
 
-  if (tokens.length === 0) {
-    console.log('⏸️ No new tokens found (waiting for Helius premium access)');
-    return;
-  }
+    console.log(`Found ${signatures.length} recent transactions to analyze`);
 
-  console.log(`Found ${tokens.length} tokens`);
+    let analyzed = 0;
+    let filtered = 0;
 
-  for (const token of tokens) {
-    try {
-      // Filter
-      if (
-        token.marketCap < config.minMarketCap ||
-        token.marketCap > config.maxMarketCap ||
-        token.liquidity < config.minLiquidity ||
-        token.holders < config.minHolders ||
-        token.ageHours < config.minAgeHours
-      ) {
+    for (const sig of signatures.slice(0, 20)) { // Analyze top 20 recent transactions
+      try {
+        // Get transaction details
+        const response = await axios.post(SOLANA_RPC, {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'getTransaction',
+          params: [sig, { encoding: 'json', maxSupportedTransactionVersion: 0 }],
+        });
+
+        if (!response.data.result) continue;
+
+        const tx = response.data.result;
+        if (!tx.transaction.message.accountKeys) continue;
+
+        // Extract token address from transaction
+        // This is simplified - in production you'd parse the transaction more carefully
+        const accounts = tx.transaction.message.accountKeys;
+        if (accounts.length < 3) continue;
+
+        const tokenAddress = accounts[0]?.pubkey;
+        if (!tokenAddress) continue;
+
+        analyzed++;
+
+        // Get token data from Dexscreener
+        const dexData = await getDexData(tokenAddress);
+        if (!dexData) {
+          filtered++;
+          continue;
+        }
+
+        // Get on-chain data
+        const holderInfo = await getHolderInfo(tokenAddress);
+        const ageHours = await getTokenAge(tokenAddress);
+
+        if (!holderInfo) {
+          filtered++;
+          continue;
+        }
+
+        // Create token object
+        const token: Token = {
+          address: tokenAddress,
+          name: dexData.name,
+          symbol: dexData.symbol,
+          marketCap: dexData.marketCap,
+          liquidity: dexData.liquidity,
+          volume24h: dexData.volume24h,
+          holders: holderInfo.holders,
+          ageHours,
+          top5HoldersPct: holderInfo.top5Pct,
+          isMintable: false, // Would need to check via RPC
+          isFreezeEnabled: false, // Would need to check via RPC
+        };
+
+        // Apply filters
+        if (
+          token.marketCap < config.minMarketCap ||
+          token.marketCap > config.maxMarketCap ||
+          token.liquidity < config.minLiquidity ||
+          token.holders < config.minHolders ||
+          token.ageHours < config.minAgeHours
+        ) {
+          filtered++;
+          continue;
+        }
+
+        // Check if already processed
+        const { data: existing } = await supabase
+          .from('alerts')
+          .select('id')
+          .eq('token_address', token.address)
+          .single();
+
+        if (existing) {
+          filtered++;
+          continue;
+        }
+
+        // Score token
+        const score = scoreToken(token);
+
+        // Save to database
+        await supabase.from('alerts').insert({
+          token_address: token.address,
+          score: score.totalScore,
+          on_chain_metrics: score.metrics,
+          risks: score.risks,
+          status: 'new',
+        });
+
+        processingCount++;
+
+        // Send alert if score is high enough
+        if (score.totalScore >= config.alertScoreThreshold && score.recommendation !== 'HIGH_RISK_SKIP') {
+          await sendAlert(token, score);
+          alertCount++;
+        }
+      } catch (error) {
+        console.error('Error processing transaction:', error);
         continue;
       }
-
-      // Check if already exists
-      const { data: existing } = await supabase.from('alerts').select('id').eq('token_address', token.address).single();
-      if (existing) continue;
-
-      // Score
-      const score = scoreToken(token);
-
-      // Save to DB
-      await supabase.from('alerts').insert({
-        token_address: token.address,
-        score: score.totalScore,
-        on_chain_metrics: score.metrics,
-        risks: score.risks,
-        status: 'new',
-      });
-
-      processingCount++;
-
-      // Alert if score high enough
-      if (score.totalScore >= config.alertScoreThreshold && score.recommendation !== 'HIGH_RISK_SKIP') {
-        await sendAlert(token, score);
-        alertCount++;
-      }
-    } catch (error) {
-      console.error(`Error processing token:`, error);
     }
-  }
 
-  console.log(`✅ Cycle complete. Total processed: ${processingCount}, Alerts sent: ${alertCount}`);
+    console.log(`✅ Cycle complete. Analyzed: ${analyzed}, Filtered: ${filtered}, Total alerts: ${alertCount}`);
+  } catch (error) {
+    console.error('❌ Listener error:', error);
+  }
 }
 
-// Start
+// Startup
 console.log('🚀 Solana Alpha Listener Starting...');
-console.log(`⚙️ Interval: ${process.env.LISTENER_INTERVAL_MS}ms`);
-console.log(`📊 Config: Market cap ${config.minMarketCap}-${config.maxMarketCap}, Liquidity ${config.minLiquidity}+, Holders ${config.minHolders}+`);
+console.log(`⚙️ Interval: ${process.env.LISTENER_INTERVAL_MS}ms (${parseInt(process.env.LISTENER_INTERVAL_MS || '300000') / 1000 / 60} minutes)`);
+console.log(`📊 Filters: Market cap ${config.minMarketCap / 1000000}M-${config.maxMarketCap / 1000000}M, Liquidity $${config.minLiquidity / 1000}K+, Holders ${config.minHolders}+, Age ${config.minAgeHours}h+`);
+console.log('');
 
 // Run immediately
 runListener().catch(console.error);
 
-// Schedule
+// Schedule recurring cycles
 const interval = parseInt(process.env.LISTENER_INTERVAL_MS || '300000');
-const cronExpression = `*/${Math.floor(interval / 1000 / 60)} * * * *`;
+const minutes = Math.floor(interval / 1000 / 60);
+const cronExpression = `*/${minutes} * * * *`;
 
 cron.schedule(cronExpression, () => {
-  console.log('⏰ Running listener cycle...');
+  console.log(`⏰ [${new Date().toISOString()}] Running listener cycle...`);
   runListener().catch(console.error);
 });
 
-console.log('✅ Listener running');
+console.log(`✅ Listener scheduled. Next run in ${minutes} minutes`);
