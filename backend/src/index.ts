@@ -52,12 +52,10 @@ const BIRDEYE_API =
 // ============================================================
 
 const config = {
-  minMarketCap: 1_000_000,
-  maxMarketCap: 10_000_000,
-
-  minLiquidity: 100_000,
-
-  minVolume24h: 50_000,
+  minMarketCap: 100_000,        // Au lieu de 1M
+  maxMarketCap: 100_000_000,    // Au lieu de 10M
+  minLiquidity: 10_000,         // Au lieu de 100k
+  minVolume24h: 10_000,         // Au lieu de 50k
 
   maxTokensPerScan: 100,
 
