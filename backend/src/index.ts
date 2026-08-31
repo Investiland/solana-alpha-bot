@@ -12,230 +12,183 @@ const supabase = createClient(
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN!, { polling: false });
 
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY!;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
-const RPC_ENDPOINT = `https://api.helius.xyz/v0?api-key=${HELIUS_API_KEY}`;
-const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex';
-const SOLANA_RPC = 'https://api.mainnet-beta.solana.com';
+const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex/search?q=solana&order=volume&limit=100';
 
-interface Token {
+interface TokenSnapshot {
   address: string;
   name: string;
   symbol: string;
+  price: number;
+  volume24h: number;
   marketCap: number;
   liquidity: number;
-  volume24h: number;
-  holders: number;
-  ageHours: number;
-  top5HoldersPct: number;
-  isMintable: boolean;
-  isFreezeEnabled: boolean;
+  priceChange24h: number;
+  timestamp: number;
 }
 
-interface ScoringResult {
-  totalScore: number;
-  metrics: { velocityScore: number; holderScore: number; liquidityScore: number; volumeScore: number };
-  risks: { rugRisk: string; mintableRisk: string; freezeRisk: string; concentrationRisk: string };
-  recommendation: string;
+interface AnomalyDetection {
+  token: TokenSnapshot;
+  zScores: {
+    volume: number;
+    price: number;
+    marketCap: number;
+    liquidity: number;
+  };
+  maxZScore: number;
+  level: 'watch' | 'alert' | 'critical';
+  anomalies: string[];
 }
 
-// Config
-const config = {
-  minMarketCap: parseInt(process.env.MIN_MARKET_CAP || '1000000'),
-  maxMarketCap: parseInt(process.env.MAX_MARKET_CAP || '10000000'),
-  minLiquidity: parseInt(process.env.MIN_LIQUIDITY || '100000'),
-  minHolders: parseInt(process.env.MIN_HOLDERS || '300'),
-  minAgeHours: parseInt(process.env.MIN_AGE_HOURS || '48'),
-  alertScoreThreshold: parseInt(process.env.ALERT_SCORE_THRESHOLD || '65'),
-};
+interface TokenMetadata {
+  holders?: number;
+  top5HoldersPct?: number;
+  isMintable?: boolean;
+  isFreezeEnabled?: boolean;
+}
 
+let lastSnapshots: Map<string, TokenSnapshot[]> = new Map();
 let processingCount = 0;
 let alertCount = 0;
-let lastProcessedSignature = '';
 
-// Get recent token transfers
-async function getRecentTokenTransfers(): Promise<string[]> {
+// Fetch top 100 Solana tokens from Dexscreener
+async function fetchTopTokens(): Promise<TokenSnapshot[]> {
   try {
-    // Query for recent token program interactions
-    // This scans for new SPL token creations and activity
-    const response = await axios.post(SOLANA_RPC, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getSignaturesForAddress',
-      params: [
-        'TokenkegQfeZyiNwAJsyFbPVwwQQfg5bgUqh7QeRH8H', // SPL Token program
-        { limit: 100 }
-      ],
-    });
-
-    if (response.data.result) {
-      return response.data.result.map((tx: any) => tx.signature);
+    const response = await axios.get(DEXSCREENER_API);
+    
+    if (!response.data?.pairs) {
+      console.log('❌ No pairs found in Dexscreener response');
+      return [];
     }
-  } catch (error) {
-    console.error('Error getting recent transfers:', error);
-  }
 
-  return [];
-}
-
-// Get token info from Dexscreener
-async function getDexData(tokenAddress: string) {
-  try {
-    const response = await axios.get(`${DEXSCREENER_API}/tokens/solana/${tokenAddress}`);
-    if (response.data?.pairs?.length > 0) {
-      const pair = response.data.pairs[0];
-      return {
+    const tokens: TokenSnapshot[] = response.data.pairs
+      .filter((pair: any) => pair.baseToken && pair.quoteToken?.symbol === 'WSOL')
+      .map((pair: any) => ({
+        address: pair.baseToken.address,
+        name: pair.baseToken.name,
+        symbol: pair.baseToken.symbol,
+        price: parseFloat(pair.priceUsd || 0),
+        volume24h: parseFloat(pair.volume?.h24 || 0),
         marketCap: parseFloat(pair.marketCap || 0),
         liquidity: parseFloat(pair.liquidity?.usd || 0),
-        volume24h: parseFloat(pair.volume?.h24 || 0),
-        name: pair.baseToken?.name || 'Unknown',
-        symbol: pair.baseToken?.symbol || 'Unknown',
-      };
-    }
-  } catch (error) {}
-  return null;
+        priceChange24h: parseFloat(pair.priceChange?.h24 || 0),
+        timestamp: Date.now(),
+      }))
+      .slice(0, 100); // Top 100
+
+    return tokens;
+  } catch (error) {
+    console.error('❌ Error fetching tokens:', error);
+    return [];
+  }
 }
 
-// Get holder info from Solana RPC
-async function getHolderInfo(tokenAddress: string) {
-  try {
-    const response = await axios.post(SOLANA_RPC, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getTokenLargestAccounts',
-      params: [tokenAddress],
-    });
-
-    if (response.data.result?.value) {
-      const accounts = response.data.result.value;
-      const totalSupply = accounts.reduce((sum: number, acc: any) => sum + parseFloat(acc.uiAmount || 0), 0);
-      const top5Amount = accounts
-        .slice(0, 5)
-        .reduce((sum: number, acc: any) => sum + parseFloat(acc.uiAmount || 0), 0);
-      const top5Pct = totalSupply > 0 ? (top5Amount / totalSupply) * 100 : 0;
-
-      return { holders: accounts.length, top5Pct };
-    }
-  } catch (error) {}
-  return null;
+// Calculate Z-score for a metric
+function calculateZScore(current: number, historical: number[]): number {
+  if (historical.length === 0) return 0;
+  
+  const mean = historical.reduce((a, b) => a + b, 0) / historical.length;
+  const variance = historical.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / historical.length;
+  const stdDev = Math.sqrt(variance);
+  
+  if (stdDev === 0) return 0;
+  return (current - mean) / stdDev;
 }
 
-// Get token age
-async function getTokenAge(tokenAddress: string): Promise<number> {
-  try {
-    const response = await axios.post(SOLANA_RPC, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getSignaturesForAddress',
-      params: [tokenAddress, { limit: 1 }],
-    });
+// Detect anomalies in token
+function detectAnomalies(token: TokenSnapshot, history: TokenSnapshot[]): AnomalyDetection {
+  const anomalies: string[] = [];
 
-    if (response.data.result?.length > 0) {
-      const blockTime = response.data.result[0].blockTime;
-      const ageMs = Date.now() - blockTime * 1000;
-      return Math.floor(ageMs / (1000 * 3600));
-    }
-  } catch (error) {}
-  return 0;
-}
+  // Calculate Z-scores based on token's own history (not global)
+  const volumes = history.map(t => t.volume24h);
+  const prices = history.map(t => t.price);
+  const marketCaps = history.map(t => t.marketCap);
+  const liquidities = history.map(t => t.liquidity);
 
-// Get token metadata
-async function getTokenMetadata(tokenAddress: string) {
-  try {
-    const response = await axios.post(SOLANA_RPC, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'getTokenSupply',
-      params: [tokenAddress],
-    });
+  const volumeZScore = calculateZScore(token.volume24h, volumes);
+  const priceZScore = calculateZScore(token.price, prices);
+  const marketCapZScore = calculateZScore(token.marketCap, marketCaps);
+  const liquidityZScore = calculateZScore(token.liquidity, liquidities);
 
-    if (response.data.result) {
-      return {
-        supply: parseFloat(response.data.result.value.amount),
-        decimals: response.data.result.value.decimals,
-      };
-    }
-  } catch (error) {}
-  return null;
-}
+  // Detect anomalies
+  if (volumeZScore >= 2.0) anomalies.push(`Volume spike: Z=${volumeZScore.toFixed(2)}`);
+  if (priceZScore >= 2.0) anomalies.push(`Price anomaly: Z=${priceZScore.toFixed(2)}`);
+  if (marketCapZScore >= 2.0) anomalies.push(`Market cap change: Z=${marketCapZScore.toFixed(2)}`);
+  if (liquidityZScore >= 2.0) anomalies.push(`Liquidity anomaly: Z=${liquidityZScore.toFixed(2)}`);
 
-// Scoring engine
-function scoreToken(token: Token): ScoringResult {
-  const velocityScore = token.volume24h / Math.max(token.liquidity, 1) > 5 ? 100 : token.volume24h / Math.max(token.liquidity, 1) > 3 ? 85 : token.volume24h / Math.max(token.liquidity, 1) > 1 ? 70 : 50;
-  const holderScore = token.holders > 1000 ? 100 : token.holders > 500 ? 90 : token.holders > 300 ? 75 : 50;
-  const liquidityScore = token.liquidity > 500000 ? 100 : token.liquidity > 250000 ? 90 : token.liquidity > 100000 ? 70 : 50;
-  const volumeScore = token.volume24h > 1000000 ? 100 : token.volume24h > 500000 ? 90 : token.volume24h > 100000 ? 70 : token.volume24h > 50000 ? 50 : 30;
-
-  let riskScore = 0;
-  if (token.top5HoldersPct > 75) riskScore += 40;
-  else if (token.top5HoldersPct > 60) riskScore += 25;
-  else if (token.top5HoldersPct > 50) riskScore += 15;
-  if (token.isMintable) riskScore += 20;
-  if (token.isFreezeEnabled) riskScore += 20;
-  if (token.ageHours < 72) riskScore += 10;
-  if (token.ageHours < 48) riskScore += 15; // Very new tokens are risky
-
-  const baseScore = Math.round(velocityScore * 0.35 + holderScore * 0.25 + liquidityScore * 0.2 + volumeScore * 0.2 - riskScore * 0.1);
-  const totalScore = Math.min(100, Math.max(0, baseScore));
-
-  const rugRisk = token.top5HoldersPct > 70 ? 'HIGH' : token.top5HoldersPct > 50 ? 'MEDIUM' : 'LOW';
-  const mintableRisk = token.isMintable ? 'HIGH' : 'LOW';
-  const freezeRisk = token.isFreezeEnabled ? 'HIGH' : 'LOW';
-  const concentrationRisk = token.top5HoldersPct > 60 ? 'HIGH' : token.top5HoldersPct > 40 ? 'MEDIUM' : 'LOW';
-
-  const recommendation =
-    rugRisk === 'HIGH' || mintableRisk === 'HIGH' || freezeRisk === 'HIGH'
-      ? 'HIGH_RISK_SKIP'
-      : totalScore >= 80
-        ? 'STRONG_BUY'
-        : totalScore >= 70
-          ? 'BUY'
-          : totalScore >= 60
-            ? 'WATCH'
-            : 'CAUTION';
+  // Determine level
+  const maxZScore = Math.max(volumeZScore, priceZScore, marketCapZScore, liquidityZScore);
+  let level: 'watch' | 'alert' | 'critical' = 'watch';
+  if (maxZScore >= 3.0) level = 'critical';
+  else if (maxZScore >= 2.5) level = 'alert';
 
   return {
-    totalScore,
-    metrics: { velocityScore, holderScore, liquidityScore, volumeScore },
-    risks: { rugRisk, mintableRisk, freezeRisk, concentrationRisk },
-    recommendation,
+    token,
+    zScores: { volume: volumeZScore, price: priceZScore, marketCap: marketCapZScore, liquidity: liquidityZScore },
+    maxZScore,
+    level,
+    anomalies,
   };
 }
 
+// Save snapshot to database
+async function saveSnapshot(token: TokenSnapshot, detection: AnomalyDetection) {
+  try {
+    await supabase.from('token_snapshots').insert({
+      token_address: token.address,
+      token_name: token.name,
+      token_symbol: token.symbol,
+      price: token.price,
+      volume_24h: token.volume24h,
+      market_cap: token.marketCap,
+      liquidity: token.liquidity,
+      price_change_24h: token.priceChange24h,
+      z_score_volume: detection.zScores.volume,
+      z_score_price: detection.zScores.price,
+      z_score_market_cap: detection.zScores.marketCap,
+      z_score_liquidity: detection.zScores.liquidity,
+      max_z_score: detection.maxZScore,
+      anomaly_level: detection.level,
+      anomalies: detection.anomalies.join(' | '),
+      created_at: new Date(token.timestamp).toISOString(),
+    });
+  } catch (error) {
+    console.error('Error saving snapshot:', error);
+  }
+}
+
 // Send Telegram alert
-async function sendAlert(token: Token, score: ScoringResult) {
+async function sendAlert(detection: AnomalyDetection) {
+  const emoji = detection.level === 'critical' ? '🔴' : detection.level === 'alert' ? '🟡' : '🔵';
+  
   const message = `
-🚀 ALPHA SIGNAL
+${emoji} ${detection.level.toUpperCase()} ANOMALY DETECTED
 
-Token: ${token.name} ($${token.symbol})
-Address: \`${token.address}\`
-Score: ${score.totalScore}/100
-Recommendation: ${score.recommendation}
+Token: ${detection.token.name} ($${detection.token.symbol})
+Address: \`${detection.token.address}\`
 
-💰 Metrics:
-- Market Cap: $${(token.marketCap / 1000000).toFixed(2)}M
-- Liquidity: $${(token.liquidity / 1000).toFixed(2)}K
-- Volume 24h: $${(token.volume24h / 1000).toFixed(2)}K
-- Holders: ${token.holders}
-- Age: ${token.ageHours}h
+📊 Metrics:
+- Price: $${detection.token.price.toFixed(6)}
+- Volume 24h: $${(detection.token.volume24h / 1000000).toFixed(2)}M
+- Market Cap: $${(detection.token.marketCap / 1000000).toFixed(2)}M
+- Liquidity: $${(detection.token.liquidity / 1000).toFixed(2)}K
+- Price Change 24h: ${detection.token.priceChange24h.toFixed(2)}%
 
-📈 Breakdown:
-- Velocity: ${Math.round(score.metrics.velocityScore)}/100
-- Holders: ${Math.round(score.metrics.holderScore)}/100
-- Liquidity: ${Math.round(score.metrics.liquidityScore)}/100
-- Volume: ${Math.round(score.metrics.volumeScore)}/100
+📈 Z-Scores:
+- Volume: ${detection.zScores.volume.toFixed(2)}
+- Price: ${detection.zScores.price.toFixed(2)}
+- Market Cap: ${detection.zScores.marketCap.toFixed(2)}
+- Liquidity: ${detection.zScores.liquidity.toFixed(2)}
 
-⚠️ Risks:
-- Rug Risk: ${score.risks.rugRisk}
-- Mintable: ${score.risks.mintableRisk}
-- Freeze: ${score.risks.freezeRisk}
+🎯 Anomalies:
+${detection.anomalies.map(a => `• ${a}`).join('\n')}
 
-🔗 [Dexscreener](https://dexscreener.com/solana/${token.address}) | [Raydium](https://raydium.io/swap/?inputCurrency=${token.address}) | [Solscan](https://solscan.io/token/${token.address})
+🔗 [Dexscreener](https://dexscreener.com/solana/${detection.token.address}) | [Raydium](https://raydium.io/swap/?inputCurrency=${detection.token.address}) | [Solscan](https://solscan.io/token/${detection.token.address})
 `;
 
   try {
     await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown', disable_web_page_preview: true });
-    console.log(`✅ Alert sent for ${token.symbol} (Score: ${score.totalScore})`);
+    console.log(`✅ Alert sent for ${detection.token.symbol} (Level: ${detection.level}, Z: ${detection.maxZScore.toFixed(2)})`);
   } catch (error) {
     console.error('Error sending Telegram alert:', error);
   }
@@ -244,136 +197,83 @@ Recommendation: ${score.recommendation}
 // Main listener cycle
 async function runListener() {
   try {
-    console.log('🔍 Scanning Solana blockchain for opportunities...');
+    console.log(`⏰ [${new Date().toISOString()}] Starting scan...`);
     
-    // Get recent token transfers
-    const signatures = await getRecentTokenTransfers();
+    // Fetch current tokens
+    const currentTokens = await fetchTopTokens();
     
-    if (signatures.length === 0) {
-      console.log('⏸️ No recent activity detected');
+    if (currentTokens.length === 0) {
+      console.log('❌ No tokens fetched');
       return;
     }
 
-    console.log(`Found ${signatures.length} recent transactions to analyze`);
+    console.log(`✅ Fetched ${currentTokens.length} tokens`);
 
-    let analyzed = 0;
-    let filtered = 0;
+    let watchCount = 0;
+    let alertsSent = 0;
 
-    for (const sig of signatures.slice(0, 20)) { // Analyze top 20 recent transactions
+    for (const token of currentTokens) {
       try {
-        // Get transaction details
-        const response = await axios.post(SOLANA_RPC, {
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getTransaction',
-          params: [sig, { encoding: 'json', maxSupportedTransactionVersion: 0 }],
-        });
+        // Get historical data for this specific token
+        const history = lastSnapshots.get(token.address) || [];
+        
+        // If we have history, detect anomalies
+        if (history.length > 0) {
+          const detection = detectAnomalies(token, history);
+          
+          // Save snapshot
+          await saveSnapshot(token, detection);
 
-        if (!response.data.result) continue;
+          // Log all Z-scores for backtesting
+          if (detection.maxZScore >= 2.0) {
+            console.log(`  📊 ${token.symbol}: Z=${detection.maxZScore.toFixed(2)} (${detection.level})`);
+            watchCount++;
+          }
 
-        const tx = response.data.result;
-        if (!tx.transaction.message.accountKeys) continue;
-
-        // Extract token address from transaction
-        // This is simplified - in production you'd parse the transaction more carefully
-        const accounts = tx.transaction.message.accountKeys;
-        if (accounts.length < 3) continue;
-
-        const tokenAddress = accounts[0]?.pubkey;
-        if (!tokenAddress) continue;
-
-        analyzed++;
-
-        // Get token data from Dexscreener
-        const dexData = await getDexData(tokenAddress);
-        if (!dexData) {
-          filtered++;
-          continue;
+          // Send alert if notable or critical
+          if (detection.level === 'alert' || detection.level === 'critical') {
+            await sendAlert(detection);
+            alertsSent++;
+            alertCount++;
+          }
+        } else {
+          // First time seeing this token, just save it
+          const initialDetection: AnomalyDetection = {
+            token,
+            zScores: { volume: 0, price: 0, marketCap: 0, liquidity: 0 },
+            maxZScore: 0,
+            level: 'watch',
+            anomalies: ['Initial snapshot'],
+          };
+          await saveSnapshot(token, initialDetection);
         }
 
-        // Get on-chain data
-        const holderInfo = await getHolderInfo(tokenAddress);
-        const ageHours = await getTokenAge(tokenAddress);
-
-        if (!holderInfo) {
-          filtered++;
-          continue;
-        }
-
-        // Create token object
-        const token: Token = {
-          address: tokenAddress,
-          name: dexData.name,
-          symbol: dexData.symbol,
-          marketCap: dexData.marketCap,
-          liquidity: dexData.liquidity,
-          volume24h: dexData.volume24h,
-          holders: holderInfo.holders,
-          ageHours,
-          top5HoldersPct: holderInfo.top5Pct,
-          isMintable: false, // Would need to check via RPC
-          isFreezeEnabled: false, // Would need to check via RPC
-        };
-
-        // Apply filters
-        if (
-          token.marketCap < config.minMarketCap ||
-          token.marketCap > config.maxMarketCap ||
-          token.liquidity < config.minLiquidity ||
-          token.holders < config.minHolders ||
-          token.ageHours < config.minAgeHours
-        ) {
-          filtered++;
-          continue;
-        }
-
-        // Check if already processed
-        const { data: existing } = await supabase
-          .from('alerts')
-          .select('id')
-          .eq('token_address', token.address)
-          .single();
-
-        if (existing) {
-          filtered++;
-          continue;
-        }
-
-        // Score token
-        const score = scoreToken(token);
-
-        // Save to database
-        await supabase.from('alerts').insert({
-          token_address: token.address,
-          score: score.totalScore,
-          on_chain_metrics: score.metrics,
-          risks: score.risks,
-          status: 'new',
-        });
+        // Keep last 10 snapshots for this token
+        const tokenHistory = lastSnapshots.get(token.address) || [];
+        tokenHistory.push(token);
+        if (tokenHistory.length > 10) tokenHistory.shift();
+        lastSnapshots.set(token.address, tokenHistory);
 
         processingCount++;
-
-        // Send alert if score is high enough
-        if (score.totalScore >= config.alertScoreThreshold && score.recommendation !== 'HIGH_RISK_SKIP') {
-          await sendAlert(token, score);
-          alertCount++;
-        }
       } catch (error) {
-        console.error('Error processing transaction:', error);
-        continue;
+        console.error(`Error processing ${token.symbol}:`, error);
       }
     }
 
-    console.log(`✅ Cycle complete. Analyzed: ${analyzed}, Filtered: ${filtered}, Total alerts: ${alertCount}`);
+    console.log(`✅ Cycle complete. Watched: ${watchCount}, Alerts sent: ${alertsSent}, Total processed: ${processingCount}`);
   } catch (error) {
     console.error('❌ Listener error:', error);
   }
 }
 
 // Startup
-console.log('🚀 Solana Alpha Listener Starting...');
+console.log('🚀 Solana Anomaly Detector Starting...');
 console.log(`⚙️ Interval: ${process.env.LISTENER_INTERVAL_MS}ms (${parseInt(process.env.LISTENER_INTERVAL_MS || '300000') / 1000 / 60} minutes)`);
-console.log(`📊 Filters: Market cap ${config.minMarketCap / 1000000}M-${config.maxMarketCap / 1000000}M, Liquidity $${config.minLiquidity / 1000}K+, Holders ${config.minHolders}+, Age ${config.minAgeHours}h+`);
+console.log('📊 Tracking: Top 100 Solana tokens by volume');
+console.log('🎯 Z-Score Levels:');
+console.log('   - Z ≥ 2.0: Watch (log only)');
+console.log('   - Z ≥ 2.5: Alert (analysis + Telegram)');
+console.log('   - Z ≥ 3.0: Critical (high priority)');
 console.log('');
 
 // Run immediately
@@ -385,8 +285,7 @@ const minutes = Math.floor(interval / 1000 / 60);
 const cronExpression = `*/${minutes} * * * *`;
 
 cron.schedule(cronExpression, () => {
-  console.log(`⏰ [${new Date().toISOString()}] Running listener cycle...`);
   runListener().catch(console.error);
 });
 
-console.log(`✅ Listener scheduled. Next run in ${minutes} minutes`);
+console.log(`✅ Listener scheduled. Runs every ${minutes} minutes`);
