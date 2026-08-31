@@ -56,39 +56,13 @@ let alertCount = 0;
 // Solana service
 async function getSolanaTokens(): Promise<Token[]> {
   try {
-    const response = await axios.post(RPC_ENDPOINT, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'searchAssets',
-      params: { page: 1, limit: 100, sortBy: 'created', sortDirection: 'desc' },
-    });
-
-    if (!response.data.result?.items) return [];
-
-    const tokens: Token[] = [];
-    for (const item of response.data.result.items.slice(0, 20)) {
-      const dexData = await getDexData(item.id);
-      const holderInfo = await getHolderInfo(item.id);
-      const ageHours = await getTokenAge(item.id);
-
-      if (dexData && holderInfo) {
-        tokens.push({
-          address: item.id,
-          name: item.content?.metadata?.name || 'Unknown',
-          symbol: item.content?.metadata?.symbol || 'Unknown',
-          marketCap: dexData.marketCap || 0,
-          liquidity: dexData.liquidity || 0,
-          volume24h: dexData.volume24h || 0,
-          holders: holderInfo.holders,
-          ageHours,
-          top5HoldersPct: holderInfo.top5Pct,
-          isMintable: item.token_info?.is_mintable || false,
-          isFreezeEnabled: item.token_info?.is_freezeable || false,
-        });
-      }
-    }
-
-    return tokens;
+    console.log('🔍 Fetching recent tokens from Solana...');
+    
+    // Helius searchAssets requires premium tier
+    // For now, return empty array
+    // We'll implement proper token discovery later
+    
+    return [];
   } catch (error) {
     console.error('Error fetching tokens:', error);
     return [];
@@ -237,7 +211,7 @@ async function runListener() {
   const tokens = await getSolanaTokens();
 
   if (tokens.length === 0) {
-    console.log('No new tokens found');
+    console.log('⏸️ No new tokens found (waiting for Helius premium access)');
     return;
   }
 
@@ -290,6 +264,7 @@ async function runListener() {
 // Start
 console.log('🚀 Solana Alpha Listener Starting...');
 console.log(`⚙️ Interval: ${process.env.LISTENER_INTERVAL_MS}ms`);
+console.log(`📊 Config: Market cap ${config.minMarketCap}-${config.maxMarketCap}, Liquidity ${config.minLiquidity}+, Holders ${config.minHolders}+`);
 
 // Run immediately
 runListener().catch(console.error);
@@ -299,6 +274,7 @@ const interval = parseInt(process.env.LISTENER_INTERVAL_MS || '300000');
 const cronExpression = `*/${Math.floor(interval / 1000 / 60)} * * * *`;
 
 cron.schedule(cronExpression, () => {
+  console.log('⏰ Running listener cycle...');
   runListener().catch(console.error);
 });
 
