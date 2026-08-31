@@ -145,6 +145,7 @@ let scanRunning = false;
 let totalScans = 0;
 let totalTokensProcessed = 0;
 let totalAlertsSent = 0;
+let birdeyeRequestCount = 0;
 
 // ============================================================
 // HELPERS
@@ -238,6 +239,13 @@ function calculateZScore(
 
 async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
   try {
+    birdeyeRequestCount++;
+    const requestNum = birdeyeRequestCount;
+    
+    console.log(
+      `🌐 Birdeye request #${requestNum} at [${new Date().toISOString()}]`
+    );
+    
     console.log(
       '🔍 Birdeye: scanning Solana token universe...'
     );
@@ -275,6 +283,17 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
         timeout:
           config.requestTimeoutMs,
       }
+    );
+
+    // Log rate limit headers
+    const rateLimit = {
+      limit: response.headers['x-ratelimit-limit'],
+      remaining: response.headers['x-ratelimit-remaining'],
+      reset: response.headers['x-ratelimit-reset'],
+    };
+
+    console.log(
+      `✅ Birdeye request #${requestNum} succeeded | Rate limit: ${rateLimit.remaining}/${rateLimit.limit} | Reset at: ${rateLimit.reset}`
     );
 
     const rawTokens =
@@ -375,18 +394,43 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
     return tokens;
   } catch (error) {
     console.error(
-      '❌ Birdeye discovery error:',
-      error
+      `❌ Birdeye request #${birdeyeRequestCount} FAILED`
     );
 
     if (axios.isAxiosError(error)) {
+      const status = error.response?.status;
+      const headers = error.response?.headers;
+      
       console.error(
-        'HTTP status:',
-        error.response?.status
+        `HTTP status: ${status}`
       );
+
+      if (status === 429) {
+        console.error(
+          '⚠️ RATE LIMIT HIT (429)'
+        );
+        console.error(
+          `x-ratelimit-limit: ${headers['x-ratelimit-limit']}`
+        );
+        console.error(
+          `x-ratelimit-remaining: ${headers['x-ratelimit-remaining']}`
+        );
+        console.error(
+          `x-ratelimit-reset: ${headers['x-ratelimit-reset']}`
+        );
+        console.error(
+          `retry-after: ${headers['retry-after']}`
+        );
+      }
+
       console.error(
         'Response data:',
         error.response?.data
+      );
+    } else {
+      console.error(
+        'Error details:',
+        error
       );
     }
 
@@ -1037,7 +1081,7 @@ async function runListener(): Promise<void> {
     );
 
     console.log(
-      `📈 Total stats | scans=${totalScans} | processed=${totalTokensProcessed} | alerts=${totalAlertsSent}`
+      `📈 Total stats | scans=${totalScans} | processed=${totalTokensProcessed} | alerts=${totalAlertsSent} | birdeye_requests=${birdeyeRequestCount}`
     );
   } catch (error) {
     console.error(
