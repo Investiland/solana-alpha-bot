@@ -6,23 +6,46 @@ import { createClient } from '@supabase/supabase-js';
 import cron from 'node-cron';
 
 // ============================================================
+// ENVIRONMENT
+// ============================================================
+
+const {
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID,
+  BIRDEYE_API_KEY,
+} = process.env;
+
+if (
+  !SUPABASE_URL ||
+  !SUPABASE_ANON_KEY ||
+  !TELEGRAM_BOT_TOKEN ||
+  !TELEGRAM_CHAT_ID ||
+  !BIRDEYE_API_KEY
+) {
+  throw new Error(
+    'Missing required environment variables: SUPABASE_URL, SUPABASE_ANON_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BIRDEYE_API_KEY'
+  );
+}
+
+// ============================================================
 // CLIENTS
 // ============================================================
 
 const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_ANON_KEY!
+  SUPABASE_URL,
+  SUPABASE_ANON_KEY
 );
 
 const bot = new TelegramBot(
-  process.env.TELEGRAM_BOT_TOKEN!,
-  { polling: false }
+  TELEGRAM_BOT_TOKEN,
+  {
+    polling: false,
+  }
 );
 
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
-const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY!;
-
-const BIRDEYE_TOKEN_LIST =
+const BIRDEYE_API =
   'https://public-api.birdeye.so/defi/v3/token/list';
 
 // ============================================================
@@ -32,19 +55,26 @@ const BIRDEYE_TOKEN_LIST =
 const config = {
   minMarketCap: 1_000_000,
   maxMarketCap: 10_000_000,
+
   minLiquidity: 100_000,
+
   minVolume24h: 50_000,
 
   maxTokensPerScan: 100,
 
   snapshotIntervalMinutes: 5,
+
   maxHistorySnapshots: 288,
+
+  minimumHistoryForZScore: 10,
 
   watchZ: 2.0,
   alertZ: 2.5,
   criticalZ: 3.0,
 
   minAlertRepeatMinutes: 30,
+
+  requestTimeoutMs: 15_000,
 };
 
 // ============================================================
@@ -57,6 +87,7 @@ interface TokenSnapshot {
   symbol: string;
 
   price: number;
+
   marketCap: number;
   liquidity: number;
 
@@ -74,29 +105,34 @@ interface TokenSnapshot {
   timestamp: number;
 }
 
+interface ZScores {
+  volume5m: number;
+  volume1h: number;
+  price5m: number;
+  price1h: number;
+  trades5m: number;
+}
+
+interface Health {
+  liquidityOk: boolean;
+  volumeOk: boolean;
+  marketCapOk: boolean;
+}
+
 interface AnomalyDetection {
   token: TokenSnapshot;
 
-  zScores: {
-    volume5m: number;
-    volume1h: number;
-    price5m: number;
-    price1h: number;
-    trades5m: number;
-  };
+  zScores: ZScores;
 
   maxZScore: number;
+
   opportunityScore: number;
 
   level: 'watch' | 'alert' | 'critical';
 
   anomalies: string[];
 
-  health: {
-    liquidityOk: boolean;
-    volumeOk: boolean;
-    marketCapOk: boolean;
-  };
+  health: Health;
 }
 
 // ============================================================
@@ -105,20 +141,96 @@ interface AnomalyDetection {
 
 const lastAlertAt = new Map<string, number>();
 
-let isScanning = false;
+let scanRunning = false;
+
+let totalScans = 0;
+let totalTokensProcessed = 0;
+let totalAlertsSent = 0;
 
 // ============================================================
 // HELPERS
 // ============================================================
 
 function num(value: unknown): number {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : 0;
+  const parsed = Number(value);
+
+  return Number.isFinite(parsed)
+    ? parsed
+    : 0;
 }
 
 function int(value: unknown): number {
-  const n = Number(value);
-  return Number.isFinite(n) ? Math.trunc(n) : 0;
+  const parsed = Number(value);
+
+  return Number.isFinite(parsed)
+    ? Math.trunc(parsed)
+    : 0;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function formatUsd(value: number): string {
+  if (value >= 1_000_000) {
+    return `$${(value / 1_000_000).toFixed(2)}M`;
+  }
+
+  if (value >= 1_000) {
+    return `$${(value / 1_000).toFixed(1)}K`;
+  }
+
+  return `$${value.toFixed(2)}`;
+}
+
+// ============================================================
+// Z-SCORE
+// ============================================================
+
+function calculateZScore(
+  current: number,
+  historical: number[]
+): number {
+  if (
+    historical.length <
+    config.minimumHistoryForZScore
+  ) {
+    return 0;
+  }
+
+  if (!historical.every(Number.isFinite)) {
+    return 0;
+  }
+
+  const mean =
+    historical.reduce(
+      (sum, value) => sum + value,
+      0
+    ) / historical.length;
+
+  const variance =
+    historical.reduce(
+      (sum, value) =>
+        sum + Math.pow(value - mean, 2),
+      0
+    ) / historical.length;
+
+  const standardDeviation =
+    Math.sqrt(variance);
+
+  if (
+    !Number.isFinite(standardDeviation) ||
+    standardDeviation === 0
+  ) {
+    return 0;
+  }
+
+  return (
+    (current - mean) /
+    standardDeviation
+  );
 }
 
 // ============================================================
@@ -127,35 +239,53 @@ function int(value: unknown): number {
 
 async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
   try {
-    console.log('🔍 Birdeye: scanning Solana token universe...');
+    console.log(
+      '🔍 Birdeye: scanning Solana token universe...'
+    );
 
-    const response = await axios.get(BIRDEYE_TOKEN_LIST, {
-      headers: {
-        'X-API-KEY': BIRDEYE_API_KEY,
-        'x-chain': 'solana',
-      },
+    const response = await axios.get(
+      BIRDEYE_API,
+      {
+        headers: {
+          'X-API-KEY': BIRDEYE_API_KEY,
+          'x-chain': 'solana',
+        },
 
-      params: {
-        sort_by: 'market_cap',
-        sort_type: 'desc',
+        params: {
+          sort_by: 'market_cap',
+          sort_type: 'desc',
 
-        min_market_cap: config.minMarketCap,
-        max_market_cap: config.maxMarketCap,
+          min_market_cap:
+            config.minMarketCap,
 
-        min_liquidity: config.minLiquidity,
-        min_volume_24h_usd: config.minVolume24h,
+          max_market_cap:
+            config.maxMarketCap,
 
-        limit: config.maxTokensPerScan,
-        offset: 0,
-      },
+          min_liquidity:
+            config.minLiquidity,
 
-      timeout: 15_000,
-    });
+          min_volume_24h_usd:
+            config.minVolume24h,
 
-    const rawTokens = response.data?.data?.tokens ?? [];
+          limit:
+            config.maxTokensPerScan,
+
+          offset: 0,
+        },
+
+        timeout:
+          config.requestTimeoutMs,
+      }
+    );
+
+    const rawTokens =
+      response.data?.data?.tokens ?? [];
 
     if (!Array.isArray(rawTokens)) {
-      console.error('❌ Unexpected Birdeye response structure');
+      console.error(
+        '❌ Unexpected Birdeye response structure'
+      );
+
       return [];
     }
 
@@ -163,59 +293,86 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
       `📦 Birdeye returned ${rawTokens.length} candidates`
     );
 
-    const tokens: TokenSnapshot[] = rawTokens
-      .map((token: any): TokenSnapshot => ({
-        address: String(token.address ?? ''),
-        name: String(token.name ?? 'Unknown'),
-        symbol: String(token.symbol ?? 'UNKNOWN'),
+    const tokens: TokenSnapshot[] =
+      rawTokens
+        .map((token: any) => {
+          return {
+            address:
+              typeof token.address === 'string'
+                ? token.address
+                : '',
 
-        price: num(token.price),
+            name:
+              typeof token.name === 'string'
+                ? token.name
+                : 'Unknown',
 
-        marketCap: num(token.market_cap),
+            symbol:
+              typeof token.symbol === 'string'
+                ? token.symbol
+                : 'UNKNOWN',
 
-        liquidity: num(token.liquidity),
+            price: num(token.price),
 
-        // IMPORTANT:
-        // Birdeye V3 returns snake_case fields.
-        volume24h: num(token.volume_24h_usd),
-        volume5m: num(token.volume_5m_usd),
-        volume1h: num(token.volume_1h_usd),
+            // IMPORTANT:
+            // Birdeye uses snake_case field names.
+            marketCap:
+              num(token.market_cap),
 
-        priceChange24h: num(
-          token.price_change_24h_percent
-        ),
+            liquidity:
+              num(token.liquidity),
 
-        priceChange5m: num(
-          token.price_change_5m_percent
-        ),
+            volume24h:
+              num(token.volume_24h_usd),
 
-        priceChange1h: num(
-          token.price_change_1h_percent
-        ),
+            volume5m:
+              num(token.volume_5m_usd),
 
-        trades5m: int(
-          token.trade_5m_count
-        ),
+            volume1h:
+              num(token.volume_1h_usd),
 
-        trades1h: int(
-          token.trade_1h_count
-        ),
+            priceChange24h:
+              num(
+                token.price_change_24h_percent
+              ),
 
-        timestamp: Date.now(),
-      }))
-      .filter((token) => {
-        return (
-          token.address.length > 0 &&
-          token.price > 0 &&
-          token.marketCap >= config.minMarketCap &&
-          token.marketCap <= config.maxMarketCap &&
-          token.liquidity >= config.minLiquidity &&
-          token.volume24h >= config.minVolume24h
-        );
-      });
+            priceChange5m:
+              num(
+                token.price_change_5m_percent
+              ),
+
+            priceChange1h:
+              num(
+                token.price_change_1h_percent
+              ),
+
+            trades5m:
+              int(token.trade_5m_count),
+
+            trades1h:
+              int(token.trade_1h_count),
+
+            timestamp: Date.now(),
+          };
+        })
+
+        .filter((token: TokenSnapshot) => {
+          return (
+            token.address.length > 0 &&
+            token.price > 0 &&
+            token.marketCap >=
+              config.minMarketCap &&
+            token.marketCap <=
+              config.maxMarketCap &&
+            token.liquidity >=
+              config.minLiquidity &&
+            token.volume24h >=
+              config.minVolume24h
+          );
+        });
 
     console.log(
-      `✅ ${tokens.length} tokens after local validation`
+      `✅ ${tokens.length} tokens after validation`
     );
 
     return tokens;
@@ -242,58 +399,32 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
 }
 
 // ============================================================
-// Z-SCORE
-// ============================================================
-
-function calculateZScore(
-  current: number,
-  historical: number[]
-): number {
-  if (historical.length < 10) {
-    return 0;
-  }
-
-  const mean =
-    historical.reduce(
-      (sum, value) => sum + value,
-      0
-    ) / historical.length;
-
-  const variance =
-    historical.reduce(
-      (sum, value) =>
-        sum + Math.pow(value - mean, 2),
-      0
-    ) / historical.length;
-
-  const stdDev = Math.sqrt(variance);
-
-  if (
-    !Number.isFinite(stdDev) ||
-    stdDev === 0
-  ) {
-    return 0;
-  }
-
-  return (current - mean) / stdDev;
-}
-
-// ============================================================
-// HISTORY
+// SUPABASE HISTORY
 // ============================================================
 
 async function getTokenHistory(
   tokenAddress: string
 ): Promise<TokenSnapshot[]> {
   try {
-    const { data, error } = await supabase
+    const {
+      data,
+      error,
+    } = await supabase
       .from('token_snapshots')
       .select('*')
-      .eq('token_address', tokenAddress)
-      .order('created_at', {
-        ascending: false,
-      })
-      .limit(config.maxHistorySnapshots);
+      .eq(
+        'token_address',
+        tokenAddress
+      )
+      .order(
+        'created_at',
+        {
+          ascending: false,
+        }
+      )
+      .limit(
+        config.maxHistorySnapshots
+      );
 
     if (error) {
       throw error;
@@ -305,65 +436,56 @@ async function getTokenHistory(
 
     return data
       .reverse()
-      .map((row: any): TokenSnapshot => ({
-        address: String(
-          row.token_address ?? ''
-        ),
+      .map((row: any) => {
+        return {
+          address:
+            row.token_address,
 
-        name: String(
-          row.token_name ?? 'Unknown'
-        ),
+          name:
+            row.token_name || 'Unknown',
 
-        symbol: String(
-          row.token_symbol ?? 'UNKNOWN'
-        ),
+          symbol:
+            row.token_symbol || 'UNKNOWN',
 
-        price: num(row.price),
+          price:
+            num(row.price),
 
-        marketCap: num(
-          row.market_cap
-        ),
+          marketCap:
+            num(row.market_cap),
 
-        liquidity: num(
-          row.liquidity
-        ),
+          liquidity:
+            num(row.liquidity),
 
-        volume24h: num(
-          row.volume_24h
-        ),
+          volume24h:
+            num(row.volume_24h),
 
-        volume5m: num(
-          row.volume_5m
-        ),
+          volume5m:
+            num(row.volume_5m),
 
-        volume1h: num(
-          row.volume_1h
-        ),
+          volume1h:
+            num(row.volume_1h),
 
-        priceChange24h: num(
-          row.price_change_24h
-        ),
+          priceChange24h:
+            num(row.price_change_24h),
 
-        priceChange5m: num(
-          row.price_change_5m
-        ),
+          priceChange5m:
+            num(row.price_change_5m),
 
-        priceChange1h: num(
-          row.price_change_1h
-        ),
+          priceChange1h:
+            num(row.price_change_1h),
 
-        trades5m: int(
-          row.trades_5m
-        ),
+          trades5m:
+            int(row.trades_5m),
 
-        trades1h: int(
-          row.trades_1h
-        ),
+          trades1h:
+            int(row.trades_1h),
 
-        timestamp: new Date(
-          row.created_at
-        ).getTime(),
-      }));
+          timestamp:
+            new Date(
+              row.created_at
+            ).getTime(),
+        };
+      });
   } catch (error) {
     console.error(
       `❌ History error for ${tokenAddress}:`,
@@ -375,6 +497,30 @@ async function getTokenHistory(
 }
 
 // ============================================================
+// HEALTH CHECK
+// ============================================================
+
+function getHealth(
+  token: TokenSnapshot
+): Health {
+  return {
+    liquidityOk:
+      token.liquidity >=
+      config.minLiquidity,
+
+    volumeOk:
+      token.volume24h >=
+      config.minVolume24h,
+
+    marketCapOk:
+      token.marketCap >=
+        config.minMarketCap &&
+      token.marketCap <=
+        config.maxMarketCap,
+  };
+}
+
+// ============================================================
 // ANOMALY ENGINE
 // ============================================================
 
@@ -382,43 +528,39 @@ function detectAnomalies(
   token: TokenSnapshot,
   history: TokenSnapshot[]
 ): AnomalyDetection {
-  const anomalies: string[] = [];
+  const health =
+    getHealth(token);
 
-  const health = {
-    liquidityOk:
-      token.liquidity >= config.minLiquidity,
-
-    volumeOk:
-      token.volume24h >= config.minVolume24h,
-
-    marketCapOk:
-      token.marketCap >= config.minMarketCap &&
-      token.marketCap <= config.maxMarketCap,
+  const emptyZScores: ZScores = {
+    volume5m: 0,
+    volume1h: 0,
+    price5m: 0,
+    price1h: 0,
+    trades5m: 0,
   };
 
   // ----------------------------------------------------------
   // Not enough history
   // ----------------------------------------------------------
 
-  if (history.length < 10) {
+  if (
+    history.length <
+    config.minimumHistoryForZScore
+  ) {
     return {
       token,
 
-      zScores: {
-        volume5m: 0,
-        volume1h: 0,
-        price5m: 0,
-        price1h: 0,
-        trades5m: 0,
-      },
+      zScores:
+        emptyZScores,
 
       maxZScore: 0,
+
       opportunityScore: 0,
 
       level: 'watch',
 
       anomalies: [
-        `Building baseline (${history.length}/10 snapshots)`,
+        `Building baseline (${history.length}/${config.minimumHistoryForZScore} snapshots)`,
       ],
 
       health,
@@ -426,107 +568,166 @@ function detectAnomalies(
   }
 
   // ----------------------------------------------------------
-  // HISTORICAL DATA
+  // HISTORICAL SERIES
+  //
+  // IMPORTANT:
+  // We compare volume with volume.
+  // We compare price with price.
+  // We compare trades with trades.
   // ----------------------------------------------------------
 
-  const volume5mHistory = history.map(
-    (t) => t.volume5m
-  );
+  const volume5mHistory =
+    history.map(
+      snapshot =>
+        snapshot.volume5m
+    );
 
-  const volume1hHistory = history.map(
-    (t) => t.volume1h
-  );
+  const volume1hHistory =
+    history.map(
+      snapshot =>
+        snapshot.volume1h
+    );
 
-  const price5mHistory = history.map(
-    (t) => Math.abs(t.priceChange5m)
-  );
+  const price5mHistory =
+    history.map(
+      snapshot =>
+        Math.abs(
+          snapshot.priceChange5m
+        )
+    );
 
-  const price1hHistory = history.map(
-    (t) => Math.abs(t.priceChange1h)
-  );
+  const price1hHistory =
+    history.map(
+      snapshot =>
+        Math.abs(
+          snapshot.priceChange1h
+        )
+    );
 
-  const trades5mHistory = history.map(
-    (t) => t.trades5m
-  );
+  const trades5mHistory =
+    history.map(
+      snapshot =>
+        snapshot.trades5m
+    );
 
   // ----------------------------------------------------------
   // Z-SCORES
   // ----------------------------------------------------------
 
-  const volume5mZ = calculateZScore(
-    token.volume5m,
-    volume5mHistory
-  );
+  const volume5mZ =
+    calculateZScore(
+      token.volume5m,
+      volume5mHistory
+    );
 
-  const volume1hZ = calculateZScore(
-    token.volume1h,
-    volume1hHistory
-  );
+  const volume1hZ =
+    calculateZScore(
+      token.volume1h,
+      volume1hHistory
+    );
 
-  const price5mZ = calculateZScore(
-    Math.abs(token.priceChange5m),
-    price5mHistory
-  );
+  const price5mZ =
+    calculateZScore(
+      Math.abs(
+        token.priceChange5m
+      ),
+      price5mHistory
+    );
 
-  const price1hZ = calculateZScore(
-    Math.abs(token.priceChange1h),
-    price1hHistory
-  );
+  const price1hZ =
+    calculateZScore(
+      Math.abs(
+        token.priceChange1h
+      ),
+      price1hHistory
+    );
 
-  const trades5mZ = calculateZScore(
-    token.trades5m,
-    trades5mHistory
-  );
+  const trades5mZ =
+    calculateZScore(
+      token.trades5m,
+      trades5mHistory
+    );
+
+  const zScores: ZScores = {
+    volume5m:
+      volume5mZ,
+
+    volume1h:
+      volume1hZ,
+
+    price5m:
+      price5mZ,
+
+    price1h:
+      price1hZ,
+
+    trades5m:
+      trades5mZ,
+  };
 
   // ----------------------------------------------------------
-  // ANOMALIES
+  // SIGNALS
   // ----------------------------------------------------------
 
-  if (volume5mZ >= config.watchZ) {
+  const anomalies: string[] = [];
+
+  if (
+    volume5mZ >=
+    config.watchZ
+  ) {
     anomalies.push(
-      `5m volume spike Z=${volume5mZ.toFixed(2)} ($${(
-        token.volume5m / 1000
-      ).toFixed(1)}K)`
+      `5m volume spike Z=${volume5mZ.toFixed(2)} (${formatUsd(token.volume5m)})`
     );
   }
 
-  if (volume1hZ >= config.watchZ) {
+  if (
+    volume1hZ >=
+    config.watchZ
+  ) {
     anomalies.push(
-      `1h volume spike Z=${volume1hZ.toFixed(2)} ($${(
-        token.volume1h / 1000
-      ).toFixed(1)}K)`
+      `1h volume spike Z=${volume1hZ.toFixed(2)} (${formatUsd(token.volume1h)})`
     );
   }
 
-  if (price5mZ >= config.watchZ) {
+  if (
+    price5mZ >=
+    config.watchZ
+  ) {
     anomalies.push(
-      `5m price move Z=${price5mZ.toFixed(2)} (${token.priceChange5m.toFixed(
-        2
-      )}%)`
+      `5m price move Z=${price5mZ.toFixed(2)} (${token.priceChange5m.toFixed(2)}%)`
     );
   }
 
-  if (price1hZ >= config.watchZ) {
+  if (
+    price1hZ >=
+    config.watchZ
+  ) {
     anomalies.push(
-      `1h price move Z=${price1hZ.toFixed(2)} (${token.priceChange1h.toFixed(
-        2
-      )}%)`
+      `1h price move Z=${price1hZ.toFixed(2)} (${token.priceChange1h.toFixed(2)}%)`
     );
   }
 
-  if (trades5mZ >= config.watchZ) {
+  if (
+    trades5mZ >=
+    config.watchZ
+  ) {
     anomalies.push(
       `5m trades spike Z=${trades5mZ.toFixed(2)} (${token.trades5m} trades)`
     );
   }
 
-  const maxZScore = Math.max(
-    volume5mZ,
-    volume1hZ,
-    price5mZ,
-    price1hZ,
-    trades5mZ
-  );
+  // ----------------------------------------------------------
+  // MAX Z
+  // ----------------------------------------------------------
+
+  const maxZScore =
+    Math.max(
+      volume5mZ,
+      volume1hZ,
+      price5mZ,
+      price1hZ,
+      trades5mZ
+    );
 
   // ----------------------------------------------------------
   // OPPORTUNITY SCORE
@@ -534,26 +735,43 @@ function detectAnomalies(
 
   let score = 0;
 
+  // Volume 5m
   score += Math.min(
     30,
-    Math.max(0, volume5mZ * 10)
+    Math.max(
+      0,
+      volume5mZ * 10
+    )
   );
 
+  // Trades
   score += Math.min(
     20,
-    Math.max(0, trades5mZ * 7)
+    Math.max(
+      0,
+      trades5mZ * 7
+    )
   );
 
+  // Price movement
   score += Math.min(
     20,
-    Math.max(0, price5mZ * 7)
+    Math.max(
+      0,
+      price5mZ * 7
+    )
   );
 
+  // 1h price movement
   score += Math.min(
     15,
-    Math.max(0, price1hZ * 5)
+    Math.max(
+      0,
+      price1hZ * 5
+    )
   );
 
+  // Basic market health
   if (health.liquidityOk) {
     score += 10;
   }
@@ -574,15 +792,18 @@ function detectAnomalies(
   let level:
     | 'watch'
     | 'alert'
-    | 'critical' = 'watch';
+    | 'critical' =
+    'watch';
 
   if (
-    maxZScore >= config.criticalZ &&
+    maxZScore >=
+      config.criticalZ &&
     score >= 65
   ) {
     level = 'critical';
   } else if (
-    maxZScore >= config.alertZ &&
+    maxZScore >=
+      config.alertZ &&
     score >= 50
   ) {
     level = 'alert';
@@ -591,16 +812,12 @@ function detectAnomalies(
   return {
     token,
 
-    zScores: {
-      volume5m: volume5mZ,
-      volume1h: volume1hZ,
-      price5m: price5mZ,
-      price1h: price1hZ,
-      trades5m: trades5mZ,
-    },
+    zScores,
 
     maxZScore,
-    opportunityScore: score,
+
+    opportunityScore:
+      score,
 
     level,
 
@@ -611,7 +828,7 @@ function detectAnomalies(
 }
 
 // ============================================================
-// SUPABASE
+// SAVE SNAPSHOT
 // ============================================================
 
 async function saveSnapshot(
@@ -619,21 +836,37 @@ async function saveSnapshot(
   detection: AnomalyDetection
 ): Promise<void> {
   try {
-    const { error } = await supabase
+    const {
+      error,
+    } = await supabase
       .from('token_snapshots')
       .insert({
-        token_address: token.address,
-        token_name: token.name,
-        token_symbol: token.symbol,
+        token_address:
+          token.address,
 
-        price: token.price,
+        token_name:
+          token.name,
 
-        volume_24h: token.volume24h,
-        volume_5m: token.volume5m,
-        volume_1h: token.volume1h,
+        token_symbol:
+          token.symbol,
 
-        market_cap: token.marketCap,
-        liquidity: token.liquidity,
+        price:
+          token.price,
+
+        volume_24h:
+          token.volume24h,
+
+        volume_5m:
+          token.volume5m,
+
+        volume_1h:
+          token.volume1h,
+
+        market_cap:
+          token.marketCap,
+
+        liquidity:
+          token.liquidity,
 
         price_change_24h:
           token.priceChange24h,
@@ -675,7 +908,9 @@ async function saveSnapshot(
           detection.level,
 
         anomalies:
-          detection.anomalies.join(' | '),
+          detection.anomalies.join(
+            ' | '
+          ),
 
         created_at:
           new Date(
@@ -691,96 +926,88 @@ async function saveSnapshot(
     }
   } catch (error) {
     console.error(
-      '❌ Supabase save error:',
+      '❌ Snapshot save error:',
       error
     );
   }
 }
 
 // ============================================================
-// TELEGRAM
+// TELEGRAM ALERT
 // ============================================================
 
 async function sendAlert(
   detection: AnomalyDetection
 ): Promise<boolean> {
-  const now = Date.now();
+  const address =
+    detection.token.address;
 
-  const previous =
-    lastAlertAt.get(
-      detection.token.address
-    ) ?? 0;
+  const now =
+    Date.now();
+
+  const previousAlert =
+    lastAlertAt.get(address) || 0;
 
   const cooldown =
     config.minAlertRepeatMinutes *
     60 *
     1000;
 
-  if (now - previous < cooldown) {
+  if (
+    now - previousAlert <
+    cooldown
+  ) {
     return false;
   }
 
   const emoji =
-    detection.level === 'critical'
+    detection.level ===
+    'critical'
       ? '🔴'
       : '🟡';
 
-  const signals =
-    detection.anomalies.length > 0
-      ? detection.anomalies
-          .map((x) => `• ${x}`)
-          .join('\n')
-      : '• No major anomaly';
-
   const message = `
-${emoji} ${detection.level.toUpperCase()}
+${emoji} ${detection.level.toUpperCase()} ANOMALY
 
 🎯 Opportunity Score: ${detection.opportunityScore}/100
 
-Token: ${detection.token.name} ($${detection.token.symbol})
-Address: \`${detection.token.address}\`
+🪙 Token: ${detection.token.name} ($${detection.token.symbol})
+Address: \`${address}\`
 
-💰 Market Cap: $${(
-    detection.token.marketCap / 1_000_000
-  ).toFixed(2)}M
+💰 Market Cap: ${formatUsd(detection.token.marketCap)}
+💧 Liquidity: ${formatUsd(detection.token.liquidity)}
 
-💧 Liquidity: $${(
-    detection.token.liquidity / 1_000
-  ).toFixed(0)}K
+📊 Volume
+• 5m: ${formatUsd(detection.token.volume5m)}
+• 1h: ${formatUsd(detection.token.volume1h)}
+• 24h: ${formatUsd(detection.token.volume24h)}
 
-📊 Volume:
-• 5m: $${(
-    detection.token.volume5m / 1_000
-  ).toFixed(1)}K
-
-• 1h: $${(
-    detection.token.volume1h / 1_000
-  ).toFixed(1)}K
-
-• 24h: $${(
-    detection.token.volume24h / 1_000_000
-  ).toFixed(2)}M
-
-📈 Price:
+📈 Price
 • 5m: ${detection.token.priceChange5m.toFixed(2)}%
 • 1h: ${detection.token.priceChange1h.toFixed(2)}%
 • 24h: ${detection.token.priceChange24h.toFixed(2)}%
 
-🔢 Trades:
+🔢 Trades
 • 5m: ${detection.token.trades5m}
 • 1h: ${detection.token.trades1h}
 
-📐 Z-Scores:
+📐 Z-Scores
 • Volume 5m: ${detection.zScores.volume5m.toFixed(2)}
 • Volume 1h: ${detection.zScores.volume1h.toFixed(2)}
 • Price 5m: ${detection.zScores.price5m.toFixed(2)}
 • Price 1h: ${detection.zScores.price1h.toFixed(2)}
 • Trades 5m: ${detection.zScores.trades5m.toFixed(2)}
 
-🚨 Signals:
-${signals}
+🚨 Signals
+${
+  detection.anomalies.length > 0
+    ? detection.anomalies
+        .map(signal => `• ${signal}`)
+        .join('\n')
+    : '• No major anomaly'
+}
 
-🔗 https://dexscreener.com/solana/${detection.token.address}
+🔗 https://dexscreener.com/solana/${address}
 `;
 
   try {
@@ -794,9 +1021,11 @@ ${signals}
     );
 
     lastAlertAt.set(
-      detection.token.address,
+      address,
       now
     );
+
+    totalAlertsSent++;
 
     console.log(
       `📨 Alert sent: ${detection.token.symbol} | Score ${detection.opportunityScore}`
@@ -814,11 +1043,43 @@ ${signals}
 }
 
 // ============================================================
+// CLEANUP ALERT CACHE
+// ============================================================
+
+function cleanupAlertCache(): void {
+  const now =
+    Date.now();
+
+  const expiration =
+    config.minAlertRepeatMinutes *
+    60 *
+    1000 *
+    2;
+
+  for (
+    const [
+      address,
+      timestamp,
+    ] of lastAlertAt.entries()
+  ) {
+    if (
+      now - timestamp >
+      expiration
+    ) {
+      lastAlertAt.delete(
+        address
+      );
+    }
+  }
+}
+
+// ============================================================
 // MAIN SCAN
 // ============================================================
 
 async function runListener(): Promise<void> {
-  if (isScanning) {
+  // Prevent overlapping scans.
+  if (scanRunning) {
     console.log(
       '⚠️ Previous scan still running. Skipping this cycle.'
     );
@@ -826,19 +1087,24 @@ async function runListener(): Promise<void> {
     return;
   }
 
-  isScanning = true;
+  scanRunning = true;
 
-  const startedAt = Date.now();
+  const startedAt =
+    Date.now();
+
+  totalScans++;
 
   try {
     console.log(
-      `\n⏰ [${new Date().toISOString()}] Starting scan...`
+      `\n⏰ [${new Date().toISOString()}] Starting scan #${totalScans}...`
     );
 
     const tokens =
       await fetchSolanaTokens();
 
-    if (!tokens.length) {
+    if (
+      tokens.length === 0
+    ) {
       console.log(
         '⚠️ No tokens found.'
       );
@@ -846,10 +1112,12 @@ async function runListener(): Promise<void> {
       return;
     }
 
-    let anomalies = 0;
-    let alerts = 0;
+    let anomalyCount = 0;
+    let alertCountThisScan = 0;
 
-    for (const token of tokens) {
+    for (
+      const token of tokens
+    ) {
       try {
         const history =
           await getTokenHistory(
@@ -867,22 +1135,24 @@ async function runListener(): Promise<void> {
           detection
         );
 
+        totalTokensProcessed++;
+
         if (
           detection.maxZScore >=
           config.watchZ
         ) {
-          anomalies++;
+          anomalyCount++;
 
           console.log(
-            `📊 ${token.symbol} | Z=${detection.maxZScore.toFixed(
-              2
-            )} | Score=${detection.opportunityScore} | ${detection.level} | history=${history.length}`
+            `📊 ${token.symbol} | Z=${detection.maxZScore.toFixed(2)} | Score=${detection.opportunityScore} | ${detection.level} | history=${history.length}`
           );
         }
 
         if (
-          detection.level === 'alert' ||
-          detection.level === 'critical'
+          detection.level ===
+            'alert' ||
+          detection.level ===
+            'critical'
         ) {
           const sent =
             await sendAlert(
@@ -890,7 +1160,7 @@ async function runListener(): Promise<void> {
             );
 
           if (sent) {
-            alerts++;
+            alertCountThisScan++;
           }
         }
       } catch (error) {
@@ -901,14 +1171,21 @@ async function runListener(): Promise<void> {
       }
     }
 
+    cleanupAlertCache();
+
     const duration =
       (
-        (Date.now() - startedAt) /
+        (Date.now() -
+          startedAt) /
         1000
       ).toFixed(1);
 
     console.log(
-      `✅ Scan complete | ${tokens.length} tokens | ${anomalies} anomalies | ${alerts} alerts | ${duration}s\n`
+      `✅ Scan complete | ${tokens.length} tokens | ${anomalyCount} anomalies | ${alertCountThisScan} alerts | ${duration}s`
+    );
+
+    console.log(
+      `📈 Total stats | scans=${totalScans} | processed=${totalTokensProcessed} | alerts=${totalAlertsSent}`
     );
   } catch (error) {
     console.error(
@@ -916,12 +1193,12 @@ async function runListener(): Promise<void> {
       error
     );
   } finally {
-    isScanning = false;
+    scanRunning = false;
   }
 }
 
 // ============================================================
-// STARTUP
+// START
 // ============================================================
 
 console.log(
@@ -933,15 +1210,15 @@ console.log(
 );
 
 console.log(
-  `💧 Min liquidity: $${config.minLiquidity / 1_000}K`
+  `💧 Min liquidity: ${formatUsd(config.minLiquidity)}`
 );
 
 console.log(
-  `📊 Min 24h volume: $${config.minVolume24h / 1_000}K`
+  `📊 Min 24h volume: ${formatUsd(config.minVolume24h)}`
 );
 
 console.log(
-  `⏱️ Snapshot: every ${config.snapshotIntervalMinutes} min`
+  `⏱️ Snapshot: every ${config.snapshotIntervalMinutes} minutes`
 );
 
 console.log(
@@ -956,14 +1233,30 @@ console.log(
   `🎯 Z-score: ${config.watchZ}/${config.alertZ}/${config.criticalZ}`
 );
 
+console.log(
+  `🔕 Alert cooldown: ${config.minAlertRepeatMinutes} minutes`
+);
+
 console.log('');
 
-void runListener();
+// Run immediately on startup.
+runListener().catch(error => {
+  console.error(
+    '❌ Startup scan error:',
+    error
+  );
+});
 
+// Schedule recurring scans.
 cron.schedule(
   `*/${config.snapshotIntervalMinutes} * * * *`,
   () => {
-    void runListener();
+    runListener().catch(error => {
+      console.error(
+        '❌ Scheduled scan error:',
+        error
+      );
+    });
   }
 );
 
