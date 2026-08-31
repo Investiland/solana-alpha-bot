@@ -13,7 +13,6 @@ const supabase = createClient(
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN!, { polling: false });
 
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID!;
-const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex/search?q=solana&order=volume&limit=100';
 
 interface TokenSnapshot {
   address: string;
@@ -40,13 +39,6 @@ interface AnomalyDetection {
   anomalies: string[];
 }
 
-interface TokenMetadata {
-  holders?: number;
-  top5HoldersPct?: number;
-  isMintable?: boolean;
-  isFreezeEnabled?: boolean;
-}
-
 let lastSnapshots: Map<string, TokenSnapshot[]> = new Map();
 let processingCount = 0;
 let alertCount = 0;
@@ -54,28 +46,29 @@ let alertCount = 0;
 // Fetch top 100 Solana tokens from Dexscreener
 async function fetchTopTokens(): Promise<TokenSnapshot[]> {
   try {
-    const response = await axios.get(DEXSCREENER_API);
+    const response = await axios.get('https://api.dexscreener.com/latest/dex/tokens/solana');
     
-    if (!response.data?.pairs) {
-      console.log('❌ No pairs found in Dexscreener response');
+    if (!response.data?.tokens) {
+      console.log('❌ No tokens found in response');
       return [];
     }
 
-    const tokens: TokenSnapshot[] = response.data.pairs
-      .filter((pair: any) => pair.baseToken && pair.quoteToken?.symbol === 'WSOL')
-      .map((pair: any) => ({
-        address: pair.baseToken.address,
-        name: pair.baseToken.name,
-        symbol: pair.baseToken.symbol,
-        price: parseFloat(pair.priceUsd || 0),
-        volume24h: parseFloat(pair.volume?.h24 || 0),
-        marketCap: parseFloat(pair.marketCap || 0),
-        liquidity: parseFloat(pair.liquidity?.usd || 0),
-        priceChange24h: parseFloat(pair.priceChange?.h24 || 0),
+    const tokens: TokenSnapshot[] = response.data.tokens
+      .slice(0, 100)
+      .map((token: any) => ({
+        address: token.address,
+        name: token.name || 'Unknown',
+        symbol: token.symbol || 'Unknown',
+        price: parseFloat(token.price || 0),
+        volume24h: parseFloat(token.volume24h || 0),
+        marketCap: parseFloat(token.marketCap || 0),
+        liquidity: parseFloat(token.liquidity || 0),
+        priceChange24h: parseFloat(token.priceChange?.h24 || 0),
         timestamp: Date.now(),
       }))
-      .slice(0, 100); // Top 100
+      .filter((t: TokenSnapshot) => t.price > 0);
 
+    console.log(`✅ Fetched ${tokens.length} tokens from Dexscreener`);
     return tokens;
   } catch (error) {
     console.error('❌ Error fetching tokens:', error);
@@ -99,7 +92,6 @@ function calculateZScore(current: number, historical: number[]): number {
 function detectAnomalies(token: TokenSnapshot, history: TokenSnapshot[]): AnomalyDetection {
   const anomalies: string[] = [];
 
-  // Calculate Z-scores based on token's own history (not global)
   const volumes = history.map(t => t.volume24h);
   const prices = history.map(t => t.price);
   const marketCaps = history.map(t => t.marketCap);
@@ -110,13 +102,11 @@ function detectAnomalies(token: TokenSnapshot, history: TokenSnapshot[]): Anomal
   const marketCapZScore = calculateZScore(token.marketCap, marketCaps);
   const liquidityZScore = calculateZScore(token.liquidity, liquidities);
 
-  // Detect anomalies
   if (volumeZScore >= 2.0) anomalies.push(`Volume spike: Z=${volumeZScore.toFixed(2)}`);
   if (priceZScore >= 2.0) anomalies.push(`Price anomaly: Z=${priceZScore.toFixed(2)}`);
   if (marketCapZScore >= 2.0) anomalies.push(`Market cap change: Z=${marketCapZScore.toFixed(2)}`);
   if (liquidityZScore >= 2.0) anomalies.push(`Liquidity anomaly: Z=${liquidityZScore.toFixed(2)}`);
 
-  // Determine level
   const maxZScore = Math.max(volumeZScore, priceZScore, marketCapZScore, liquidityZScore);
   let level: 'watch' | 'alert' | 'critical' = 'watch';
   if (maxZScore >= 3.0) level = 'critical';
@@ -199,7 +189,6 @@ async function runListener() {
   try {
     console.log(`⏰ [${new Date().toISOString()}] Starting scan...`);
     
-    // Fetch current tokens
     const currentTokens = await fetchTopTokens();
     
     if (currentTokens.length === 0) {
@@ -207,37 +196,29 @@ async function runListener() {
       return;
     }
 
-    console.log(`✅ Fetched ${currentTokens.length} tokens`);
-
     let watchCount = 0;
     let alertsSent = 0;
 
     for (const token of currentTokens) {
       try {
-        // Get historical data for this specific token
         const history = lastSnapshots.get(token.address) || [];
         
-        // If we have history, detect anomalies
         if (history.length > 0) {
           const detection = detectAnomalies(token, history);
           
-          // Save snapshot
           await saveSnapshot(token, detection);
 
-          // Log all Z-scores for backtesting
           if (detection.maxZScore >= 2.0) {
             console.log(`  📊 ${token.symbol}: Z=${detection.maxZScore.toFixed(2)} (${detection.level})`);
             watchCount++;
           }
 
-          // Send alert if notable or critical
           if (detection.level === 'alert' || detection.level === 'critical') {
             await sendAlert(detection);
             alertsSent++;
             alertCount++;
           }
         } else {
-          // First time seeing this token, just save it
           const initialDetection: AnomalyDetection = {
             token,
             zScores: { volume: 0, price: 0, marketCap: 0, liquidity: 0 },
@@ -248,7 +229,6 @@ async function runListener() {
           await saveSnapshot(token, initialDetection);
         }
 
-        // Keep last 10 snapshots for this token
         const tokenHistory = lastSnapshots.get(token.address) || [];
         tokenHistory.push(token);
         if (tokenHistory.length > 10) tokenHistory.shift();
@@ -276,10 +256,8 @@ console.log('   - Z ≥ 2.5: Alert (analysis + Telegram)');
 console.log('   - Z ≥ 3.0: Critical (high priority)');
 console.log('');
 
-// Run immediately
 runListener().catch(console.error);
 
-// Schedule recurring cycles
 const interval = parseInt(process.env.LISTENER_INTERVAL_MS || '300000');
 const minutes = Math.floor(interval / 1000 / 60);
 const cronExpression = `*/${minutes} * * * *`;
