@@ -47,6 +47,9 @@ const bot = new TelegramBot(
 const BIRDEYE_API =
   'https://public-api.birdeye.so/defi/v3/token/list';
 
+const BIRDEYE_TOKEN_CREATION_INFO =
+  'https://public-api.birdeye.so/defi/token_creation_info';
+
 // ============================================================
 // CONFIG
 // ============================================================
@@ -66,6 +69,8 @@ const config = {
   maxHistorySnapshots: 288,
 
   minimumHistoryForZScore: 10,
+
+  minAgeHours: 7 * 24,
 
   watchZ: 2.0,
   alertZ: 2.5,
@@ -102,6 +107,8 @@ interface TokenSnapshot {
   trades1h: number;
 
   timestamp: number;
+
+  createdAt?: number;
 }
 
 interface ZScores {
@@ -231,6 +238,60 @@ function calculateZScore(
     (current - mean) /
     standardDeviation
   );
+}
+
+// ============================================================
+// TOKEN CREATION INFO
+// ============================================================
+
+async function fetchTokenCreationTime(
+  tokenAddress: string
+): Promise<number | null> {
+  try {
+    console.log(
+      `🕐 Fetching creation time for ${tokenAddress}...`
+    );
+
+    const response = await axios.get(
+      BIRDEYE_TOKEN_CREATION_INFO,
+      {
+        headers: {
+          'X-API-KEY': BIRDEYE_API_KEY,
+          'x-chain': 'solana',
+        },
+
+        params: {
+          address: tokenAddress,
+        },
+
+        timeout: config.requestTimeoutMs,
+      }
+    );
+
+    const blockTime = response.data?.data?.blockTime;
+
+    if (!blockTime) {
+      console.warn(
+        `⚠️ No blockTime for ${tokenAddress}`
+      );
+      return null;
+    }
+
+    const createdAtMs = blockTime * 1000;
+
+    console.log(
+      `✅ Token created at: ${new Date(createdAtMs).toISOString()}`
+    );
+
+    return createdAtMs;
+  } catch (error) {
+    console.error(
+      `❌ Creation time fetch error for ${tokenAddress}:`,
+      error
+    );
+
+    return null;
+  }
 }
 
 // ============================================================
@@ -396,7 +457,22 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
       `✅ ${tokens.length} tokens after validation`
     );
 
-    return tokens;
+    // Enrich tokens with creation time (only for new tokens to save API calls)
+    const enrichedTokens = await Promise.all(
+      tokens.map(async (token) => {
+        if (!token.createdAt) {
+          const createdAt = await fetchTokenCreationTime(
+            token.address
+          );
+          if (createdAt) {
+            token.createdAt = createdAt;
+          }
+        }
+        return token;
+      })
+    );
+
+    return enrichedTokens;
   } catch (error) {
     console.error(
       `❌ Birdeye request #${birdeyeRequestCount} FAILED`
@@ -446,6 +522,33 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
 // ============================================================
 // HISTORY
 // ============================================================
+
+async function getTokenCreatedAt(
+  tokenAddress: string
+): Promise<number | null> {
+  try {
+    const { data, error } =
+      await supabase
+        .from('token_snapshots')
+        .select('token_created_at')
+        .eq('token_address', tokenAddress)
+        .limit(1)
+        .single();
+
+    if (error || !data) return null;
+
+    const createdAt = data.token_created_at;
+    if (!createdAt) return null;
+
+    return new Date(createdAt).getTime();
+  } catch (error) {
+    console.error(
+      `❌ Get created_at error for ${tokenAddress}:`,
+      error
+    );
+    return null;
+  }
+}
 
 async function getTokenHistory(
   tokenAddress: string
@@ -498,6 +601,10 @@ async function getTokenHistory(
         timestamp: new Date(
           row.created_at
         ).getTime(),
+
+        createdAt: row.token_created_at
+          ? new Date(row.token_created_at).getTime()
+          : undefined,
       })
     );
   } catch (error) {
@@ -697,16 +804,30 @@ function detectAnomalies(
   let level: 'watch' | 'alert' | 'critical' =
     'watch';
 
-  if (
-    maxZScore >= config.criticalZ &&
-    score >= 65
-  ) {
-    level = 'critical';
-  } else if (
-    maxZScore >= config.alertZ &&
-    score >= 50
-  ) {
-    level = 'alert';
+  // Filtres pour opportunités haussières
+  const tokenAgeHours = token.createdAt 
+    ? (Date.now() - token.createdAt) / (1000 * 60 * 60)
+    : Infinity;
+
+  const isOldEnough = tokenAgeHours >= config.minAgeHours;
+  const hasPositiveMove = token.priceChange5m > 0 || token.priceChange1h > 0;
+  const hasSufficientMove = token.priceChange5m >= 5 || token.priceChange1h >= 5;
+
+  const meetsOpportunityRequirements = 
+    isOldEnough && hasPositiveMove && hasSufficientMove;
+
+  if (meetsOpportunityRequirements) {
+    if (
+      maxZScore >= config.criticalZ &&
+      score >= 65
+    ) {
+      level = 'critical';
+    } else if (
+      maxZScore >= config.alertZ &&
+      score >= 50
+    ) {
+      level = 'alert';
+    }
   }
 
   return {
@@ -815,6 +936,11 @@ async function saveSnapshot(
             detection.anomalies.join(
               ' | '
             ),
+
+          token_created_at:
+            token.createdAt
+              ? new Date(token.createdAt).toISOString()
+              : null,
 
           created_at:
             new Date(
@@ -1026,6 +1152,17 @@ async function runListener(): Promise<void> {
           await getTokenHistory(
             token.address
           );
+
+        // Get createdAt from DB cache if not in current token
+        if (!token.createdAt) {
+          const cachedCreatedAt =
+            await getTokenCreatedAt(
+              token.address
+            );
+          if (cachedCreatedAt) {
+            token.createdAt = cachedCreatedAt;
+          }
+        }
 
         const detection =
           detectAnomalies(
