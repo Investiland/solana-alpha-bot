@@ -274,6 +274,9 @@ async function fetchTokenCreationTime(
       console.warn(
         `⚠️ No blockTime for ${tokenAddress}`
       );
+      console.log(
+        `📄 Response: ${JSON.stringify(response.data, null, 2).slice(0, 1000)}`
+      );
       return null;
     }
 
