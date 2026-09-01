@@ -240,6 +240,40 @@ function calculateZScore(
   );
 }
 
+async function upsertToken(
+  token: TokenSnapshot
+): Promise<void> {
+  try {
+    const { error } = await supabase
+      .from('tokens')
+      .upsert({
+        token_address: token.address,
+        token_name: token.name,
+        token_symbol: token.symbol,
+        created_at: token.createdAt
+          ? new Date(token.createdAt).toISOString()
+          : null,
+        creation_status: token.createdAt
+          ? 'enriched'
+          : 'new',
+        creation_last_attempt_at:
+          new Date().toISOString(),
+      });
+
+    if (error) {
+      console.error(
+        `❌ Upsert token error for ${token.symbol}:`,
+        error
+      );
+    }
+  } catch (error) {
+    console.error(
+      `❌ Token upsert error:`,
+      error
+    );
+  }
+}
+
 // ============================================================
 // TOKEN CREATION INFO
 // ============================================================
@@ -466,33 +500,54 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
       `✅ ${tokens.length} tokens after validation`
     );
 
-    // Enrich tokens with creation time (only for new tokens to save API calls)
+    // Enrich tokens with creation time
+    // Check DB first, only call Birdeye for new tokens
     let creationInfoCalls = 0;
-    const maxCreationInfoCallsPerScan = 5;
 
     const enrichedTokens = await Promise.all(
       tokens.map(async (token) => {
         if (!token.createdAt) {
-          // Check DB first
-          const cachedCreatedAt =
-            await getTokenCreatedAt(
-              token.address
-            );
-          if (cachedCreatedAt) {
-            token.createdAt = cachedCreatedAt;
-          } else if (
-            creationInfoCalls <
-            maxCreationInfoCallsPerScan
-          ) {
-            // Only fetch from Birdeye if under limit
-            creationInfoCalls++;
-            const createdAt =
-              await fetchTokenCreationTime(
-                token.address
+          // Check tokens table in DB first
+          try {
+            const { data: existingToken } =
+              await supabase
+                .from('tokens')
+                .select(
+                  'created_at'
+                )
+                .eq(
+                  'token_address',
+                  token.address
+                )
+                .single();
+
+            if (
+              existingToken &&
+              existingToken.created_at
+            ) {
+              // Use cached date
+              token.createdAt = new Date(
+                existingToken.created_at
+              ).getTime();
+              console.log(
+                `📦 Using cached created_at for ${token.symbol}`
               );
-            if (createdAt) {
-              token.createdAt = createdAt;
+            } else {
+              // Truly new token, fetch from Birdeye
+              creationInfoCalls++;
+              const createdAt =
+                await fetchTokenCreationTime(
+                  token.address
+                );
+              if (createdAt) {
+                token.createdAt = createdAt;
+              }
             }
+          } catch (error) {
+            console.error(
+              `❌ Error checking token DB:`,
+              error
+            );
           }
         }
         return token;
@@ -500,7 +555,7 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
     );
 
     console.log(
-      `📦 Made ${creationInfoCalls} creation info API calls this scan`
+      `📦 Made ${creationInfoCalls} NEW creation info API calls this scan`
     );
 
     return enrichedTokens;
@@ -1205,6 +1260,8 @@ async function runListener(): Promise<void> {
           token,
           detection
         );
+
+        await upsertToken(token);
 
         totalTokensProcessed++;
 
