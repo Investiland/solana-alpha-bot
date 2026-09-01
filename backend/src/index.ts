@@ -302,7 +302,7 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
     );
 
     const rawTokens =
-      response.data?.data?.tokens ?? [];
+      response.data?.data?.items ?? [];
 
     if (!Array.isArray(rawTokens)) {
       console.error(
