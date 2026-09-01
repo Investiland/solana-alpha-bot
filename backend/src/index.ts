@@ -1256,12 +1256,12 @@ async function runListener(): Promise<void> {
             history
           );
 
+        await upsertToken(token);
+
         await saveSnapshot(
           token,
           detection
         );
-
-        await upsertToken(token);
 
         totalTokensProcessed++;
 
