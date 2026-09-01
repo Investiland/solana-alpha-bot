@@ -285,10 +285,16 @@ async function fetchTokenCreationTime(
 
     return createdAtMs;
   } catch (error) {
-    console.error(
-      `❌ Creation time fetch error for ${tokenAddress}:`,
-      error
-    );
+    if (axios.isAxiosError(error) && error.response?.status === 429) {
+      console.error(
+        `❌ Rate limited on creation info for ${tokenAddress}. Skipping.`
+      );
+    } else {
+      console.error(
+        `❌ Creation time fetch error for ${tokenAddress}:`,
+        error
+      );
+    }
 
     return null;
   }
@@ -458,18 +464,40 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
     );
 
     // Enrich tokens with creation time (only for new tokens to save API calls)
+    let creationInfoCalls = 0;
+    const maxCreationInfoCallsPerScan = 5;
+
     const enrichedTokens = await Promise.all(
       tokens.map(async (token) => {
         if (!token.createdAt) {
-          const createdAt = await fetchTokenCreationTime(
-            token.address
-          );
-          if (createdAt) {
-            token.createdAt = createdAt;
+          // Check DB first
+          const cachedCreatedAt =
+            await getTokenCreatedAt(
+              token.address
+            );
+          if (cachedCreatedAt) {
+            token.createdAt = cachedCreatedAt;
+          } else if (
+            creationInfoCalls <
+            maxCreationInfoCallsPerScan
+          ) {
+            // Only fetch from Birdeye if under limit
+            creationInfoCalls++;
+            const createdAt =
+              await fetchTokenCreationTime(
+                token.address
+              );
+            if (createdAt) {
+              token.createdAt = createdAt;
+            }
           }
         }
         return token;
       })
+    );
+
+    console.log(
+      `📦 Made ${creationInfoCalls} creation info API calls this scan`
     );
 
     return enrichedTokens;
