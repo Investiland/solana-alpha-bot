@@ -502,10 +502,12 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
 
     // Enrich tokens with creation time
     // Check DB first, only call Birdeye for new tokens
-    // Limit concurrent API calls to avoid rate limiting
-    const maxConcurrentCalls = 2;
+    // Limit to 1 concurrent call with delay to avoid rate limiting
+    const maxConcurrentCalls = 1;
+    const delayBetweenCalls = 1000; // 1 second delay
     let activeRequests = 0;
     const queue: Array<() => Promise<void>> = [];
+    let lastCallTime = 0;
 
     const enrichedTokens = await Promise.all(
       tokens.map(async (token) => {
@@ -535,11 +537,25 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
                     token.createdAt = new Date(
                       existingToken.created_at
                     ).getTime();
-                    console.log(
-                      `📦 Using cached created_at for ${token.symbol}`
-                    );
                   } else {
                     // Truly new token, fetch from Birdeye
+                    // Add delay to respect rate limits
+                    const timeSinceLastCall =
+                      Date.now() -
+                      lastCallTime;
+                    if (
+                      timeSinceLastCall <
+                      delayBetweenCalls
+                    ) {
+                      await sleep(
+                        delayBetweenCalls -
+                          timeSinceLastCall
+                      );
+                    }
+
+                    lastCallTime =
+                      Date.now();
+
                     const createdAt =
                       await fetchTokenCreationTime(
                         token.address
@@ -589,10 +605,6 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
           }
         );
       })
-    );
-
-    console.log(
-      `📦 Enriched tokens with creation times`
     );
 
     return enrichedTokens;
