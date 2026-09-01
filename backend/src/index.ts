@@ -629,7 +629,8 @@ function detectAnomalies(
 
   if (
     price5mZ >=
-    config.watchZ
+    config.watchZ &&
+    token.priceChange5m > 0
   ) {
     anomalies.push(
       `5m price move Z=${price5mZ.toFixed(2)} (${token.priceChange5m.toFixed(2)}%)`
@@ -638,7 +639,8 @@ function detectAnomalies(
 
   if (
     price1hZ >=
-    config.watchZ
+    config.watchZ &&
+    token.priceChange1h > 0
   ) {
     anomalies.push(
       `1h price move Z=${price1hZ.toFixed(2)} (${token.priceChange1h.toFixed(2)}%)`
