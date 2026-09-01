@@ -948,10 +948,12 @@ function detectAnomalies(
   const hasPositiveMove = token.priceChange5m > 0 || token.priceChange1h > 0;
   const hasSufficientMove = token.priceChange5m >= 5 || token.priceChange1h >= 5;
 
-  const meetsOpportunityRequirements = 
-    isOldEnough && hasPositiveMove && hasSufficientMove;
-
-  if (meetsOpportunityRequirements) {
+  // Only allow alert/critical if ALL conditions are met
+  if (
+    isOldEnough &&
+    hasPositiveMove &&
+    hasSufficientMove
+  ) {
     if (
       maxZScore >= config.criticalZ &&
       score >= 65
