@@ -52,10 +52,12 @@ const BIRDEYE_API =
 // ============================================================
 
 const config = {
-  minMarketCap: 100_000,        // Au lieu de 1M
-  maxMarketCap: 100_000_000,    // Au lieu de 10M
-  minLiquidity: 10_000,         // Au lieu de 100k
-  minVolume24h: 10_000,         // Au lieu de 50k
+  minMarketCap: 1_000_000,
+  maxMarketCap: 10_000_000,
+
+  minLiquidity: 100_000,
+
+  minVolume24h: 50_000,
 
   maxTokensPerScan: 100,
 
@@ -292,6 +294,11 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
 
     console.log(
       `✅ Birdeye request #${requestNum} succeeded | Rate limit: ${rateLimit.remaining}/${rateLimit.limit} | Reset at: ${rateLimit.reset}`
+    );
+
+    console.log(
+      '📦 BIRDEYE RAW RESPONSE:',
+      JSON.stringify(response.data, null, 2).slice(0, 5000)
     );
 
     const rawTokens =
