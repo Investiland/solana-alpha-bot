@@ -268,11 +268,11 @@ async function fetchTokenCreationTime(
       }
     );
 
-    const blockTime = response.data?.data?.blockTime;
+    const blockUnixTime = response.data?.data?.blockUnixTime;
 
-    if (!blockTime) {
+    if (!blockUnixTime) {
       console.warn(
-        `⚠️ No blockTime for ${tokenAddress}`
+        `⚠️ No blockUnixTime for ${tokenAddress}`
       );
       console.log(
         `📄 Response: ${JSON.stringify(response.data, null, 2).slice(0, 1000)}`
@@ -280,7 +280,7 @@ async function fetchTokenCreationTime(
       return null;
     }
 
-    const createdAtMs = blockTime * 1000;
+    const createdAtMs = blockUnixTime * 1000;
 
     console.log(
       `✅ Token created at: ${new Date(createdAtMs).toISOString()}`
