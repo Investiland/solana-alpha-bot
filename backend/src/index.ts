@@ -502,60 +502,97 @@ async function fetchSolanaTokens(): Promise<TokenSnapshot[]> {
 
     // Enrich tokens with creation time
     // Check DB first, only call Birdeye for new tokens
-    let creationInfoCalls = 0;
+    // Limit concurrent API calls to avoid rate limiting
+    const maxConcurrentCalls = 2;
+    let activeRequests = 0;
+    const queue: Array<() => Promise<void>> = [];
 
     const enrichedTokens = await Promise.all(
       tokens.map(async (token) => {
-        if (!token.createdAt) {
-          // Check tokens table in DB first
-          try {
-            const { data: existingToken } =
-              await supabase
-                .from('tokens')
-                .select(
-                  'created_at'
-                )
-                .eq(
-                  'token_address',
-                  token.address
-                )
-                .single();
+        return new Promise<TokenSnapshot>(
+          (resolve) => {
+            const task = async () => {
+              if (!token.createdAt) {
+                // Check tokens table in DB first
+                try {
+                  const { data: existingToken } =
+                    await supabase
+                      .from('tokens')
+                      .select(
+                        'created_at'
+                      )
+                      .eq(
+                        'token_address',
+                        token.address
+                      )
+                      .single();
+
+                  if (
+                    existingToken &&
+                    existingToken.created_at
+                  ) {
+                    // Use cached date
+                    token.createdAt = new Date(
+                      existingToken.created_at
+                    ).getTime();
+                    console.log(
+                      `📦 Using cached created_at for ${token.symbol}`
+                    );
+                  } else {
+                    // Truly new token, fetch from Birdeye
+                    const createdAt =
+                      await fetchTokenCreationTime(
+                        token.address
+                      );
+                    if (createdAt) {
+                      token.createdAt = createdAt;
+                    }
+                  }
+                } catch (error) {
+                  console.error(
+                    `❌ Error checking token DB:`,
+                    error
+                  );
+                }
+              }
+              resolve(token);
+              activeRequests--;
+              processQueue();
+            };
+
+            const processQueue = () => {
+              while (
+                activeRequests <
+                maxConcurrentCalls &&
+                queue.length > 0
+              ) {
+                activeRequests++;
+                const nextTask =
+                  queue.shift();
+                if (nextTask) {
+                  nextTask().catch(
+                    console.error
+                  );
+                }
+              }
+            };
 
             if (
-              existingToken &&
-              existingToken.created_at
+              activeRequests <
+              maxConcurrentCalls
             ) {
-              // Use cached date
-              token.createdAt = new Date(
-                existingToken.created_at
-              ).getTime();
-              console.log(
-                `📦 Using cached created_at for ${token.symbol}`
-              );
+              activeRequests++;
+              task().catch(console.error);
             } else {
-              // Truly new token, fetch from Birdeye
-              creationInfoCalls++;
-              const createdAt =
-                await fetchTokenCreationTime(
-                  token.address
-                );
-              if (createdAt) {
-                token.createdAt = createdAt;
-              }
+              queue.push(task);
             }
-          } catch (error) {
-            console.error(
-              `❌ Error checking token DB:`,
-              error
-            );
           }
-        }
-        return token;
+        );
       })
     );
 
     console.log(
-      `📦 Made ${creationInfoCalls} NEW creation info API calls this scan`
+      `📦 Enriched tokens with creation times`
     );
 
     return enrichedTokens;
